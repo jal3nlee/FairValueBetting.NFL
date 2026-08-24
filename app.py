@@ -253,6 +253,8 @@ def run_app():
     now_utc = datetime.now(timezone.utc)
     eff_bankroll = 1000.0
     eff_kelly = 0.5
+    if LOGO_PATH:
+        st.image(str(LOGO_PATH), width=280)
     tabs = st.tabs([
         "Fair Value Model",
         "Matchup Center",
