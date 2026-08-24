@@ -253,9 +253,13 @@ def _render_player_context(player: dict, ctx: dict):
 
 def render_player_research_view(supabase, now_utc):
     st.markdown("### Player Search")
+    # render_nfl_player_search returns None both while the user is still
+    # choosing Team/Position (before pressing Load Players) and when a
+    # loaded roster has no eligible players — the widget itself already
+    # gives the right feedback for each case (a Load Players button, or a
+    # disabled "No eligible players" selectbox), so nothing else to show here.
     player = render_nfl_player_search("ps_slot", allowed_positions=["QB", "RB", "WR", "TE"])
     if not player:
-        st.caption("No eligible players for this team/position.")
         return
 
     ctx = get_team_game_context(supabase, player["team"], now_utc)
@@ -266,8 +270,26 @@ def render_player_research_view(supabase, now_utc):
     with st.expander("Prop Analysis", expanded=True):
         _render_prop_analysis(player, ctx, supabase, now_utc)
 
-    with st.expander("Player Context", expanded=False):
-        _render_player_context(player, ctx)
+    st.markdown("<div style='margin-top:10px'></div>", unsafe_allow_html=True)
+
+    # Player Context is genuinely deferred (not just visually collapsed):
+    # in the Streamlit version this app runs, code inside a plain
+    # st.expander executes on every rerun regardless of its open/closed
+    # state, so a plain expander here would still call
+    # get_expanded_season_stats/get_usage_samples/get_recent_games/
+    # get_opponent_defense on every unrelated interaction on the page.
+    # This explicit open/closed toggle, keyed per player, means that work
+    # only runs when the user actually opens it — and each newly selected
+    # player starts closed, since the key changes with the player.
+    _pc_key = f"ps_pc_open__{player['team']}__{player['name']}"
+    _pc_open = st.session_state.get(_pc_key, False)
+    if st.button(f"Player Context {'▾' if _pc_open else '▸'}", key=f"{_pc_key}_btn"):
+        _pc_open = not _pc_open
+        st.session_state[_pc_key] = _pc_open
+
+    if _pc_open:
+        with st.container(border=True):
+            _render_player_context(player, ctx)
 
 
 def render(supabase, now_utc):
