@@ -145,7 +145,7 @@ PROP_LABEL_TO_ODDS_MARKET = {
     "Anytime TD":       "player_anytime_td",
 }
 
-DEBUG_SEASON = True  # temporary — confirms real get_current_season() value
+DEBUG_SEASON = False  # temporary — confirms real get_current_season() value
 
 
 def _norm_name(name: str) -> str:
