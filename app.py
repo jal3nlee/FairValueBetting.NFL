@@ -1,11 +1,17 @@
 # app.py
+import base64
+import hashlib
+import json
 import os
 from datetime import datetime, timezone
+import httpx
 import streamlit as st
+import streamlit.components.v1 as components
 from pathlib import Path
 from PIL import Image
-from supabase import create_client, Client
-from streamlit_cookies_manager import EncryptedCookieManager
+from cryptography.fernet import Fernet, InvalidToken
+from supabase import create_client, Client, ClientOptions
+from supabase_auth.errors import AuthRetryableError
 from core.data_sources import infer_current_week_index
 from tabs import (
     fair_value_model,
@@ -20,53 +26,221 @@ from tabs import (
 # =======================
 # AUTH
 # =======================
+# Login lives in st.session_state (survives normal reruns/tab switches
+# within a browser session) plus an optional persistent browser cookie
+# (survives closing/reopening the browser). A prior streamlit-cookies-
+# manager-v2-based "Keep me logged in" cookie was the same bidirectional
+# custom-component architecture confirmed elsewhere in this product family
+# to cause a continuous reload/reconnect loop in production: a Python-
+# visible return value Streamlit polls for changes, gated behind a
+# readiness handshake that blocks the whole app behind st.stop() until the
+# component reports back. Do not reintroduce that library or any other
+# component built the same way.
+#
+# The persistence mechanism here is deliberately asymmetric to avoid that
+# failure mode entirely:
+#   - READ: st.context.cookies -- a native, read-only Streamlit property
+#     populated directly from the incoming request's Cookie header. No
+#     component, no async round-trip, no readiness gate, available on the
+#     very first script run.
+#   - WRITE: st.components.v1.html() (see _write_persisted_cookie /
+#     _clear_persisted_cookie below) -- a plain iframe with a vanilla JS
+#     snippet. This has no key= and no return value Streamlit tracks, so
+#     it structurally cannot trigger a rerun on its own, and it's only
+#     ever called when the persisted token pair actually needs to change
+#     (see _persist_if_changed) -- never on a normal rerun where nothing
+#     changed.
 SUPABASE_URL      = os.getenv("SUPABASE_URL", "")
 SUPABASE_ANON_KEY = os.getenv("SUPABASE_ANON_KEY", "")
 COOKIE_SECRET     = os.getenv("COOKIE_SECRET", "")
 if not SUPABASE_URL or not SUPABASE_ANON_KEY:
     st.error("Auth not configured. Add SUPABASE_URL and SUPABASE_ANON_KEY to environment.")
     st.stop()
-if not COOKIE_SECRET:
-    st.error("COOKIE_SECRET is not set. Add it to your environment variables.")
-    st.stop()
-supabase: Client = create_client(SUPABASE_URL, SUPABASE_ANON_KEY)
-cookies = EncryptedCookieManager(prefix="fvb_", password=COOKIE_SECRET)
-if not cookies.ready():
-    st.stop()
+
+PERSIST_COOKIE_NAME = "fvb_nfl_sess"
+PERSIST_COOKIE_MAX_AGE = 30 * 24 * 3600  # 30 days
+
+
+def _get_fernet():
+    """None if COOKIE_SECRET isn't configured -- persistent login is then
+    simply unavailable and the app falls back to today's session-only
+    behavior; it never weakens actual Supabase auth validation."""
+    if not COOKIE_SECRET:
+        return None
+    key = base64.urlsafe_b64encode(hashlib.sha256(COOKIE_SECRET.encode()).digest())
+    return Fernet(key)
+
+
+def _encode_persisted_session(access_token, refresh_token):
+    f = _get_fernet()
+    if not f:
+        return None
+    payload = json.dumps({"a": access_token, "r": refresh_token}).encode()
+    return f.encrypt(payload).decode()
+
+
+def _decode_persisted_session(raw):
+    """Encryption here only protects the plaintext token pair sitting in
+    the cookie -- it is not protection against a stolen cookie being
+    replayed, and not a substitute for Supabase's own token validation.
+    A tampered, corrupted, or foreign value fails decryption/parsing here
+    and is treated as no cookie present, never as a valid session."""
+    f = _get_fernet()
+    if not f or not raw:
+        return None
+    try:
+        payload = f.decrypt(raw.encode())
+        data = json.loads(payload)
+        access_token, refresh_token = data.get("a"), data.get("r")
+        if access_token and refresh_token:
+            return access_token, refresh_token
+    except (InvalidToken, ValueError, TypeError, KeyError):
+        pass
+    return None
+
+
+def _write_persisted_cookie(value):
+    # Cannot be HttpOnly -- Streamlit has no server-side response-header
+    # hook to set that from application code, so the write must go through
+    # JS, which is fundamentally unable to set HttpOnly cookies. Secure +
+    # SameSite=Lax + a narrow Path + encrypting the payload are the
+    # practical mitigations available here; see the module comment above.
+    _safe_value = value.replace("'", "").replace('"', "").replace(";", "").replace("\n", "")
+    components.html(
+        f"<script>document.cookie = "
+        f"\"{PERSIST_COOKIE_NAME}={_safe_value}; Max-Age={PERSIST_COOKIE_MAX_AGE}; "
+        f"Path=/; SameSite=Lax; Secure\";</script>",
+        height=0,
+    )
+
+
+def _clear_persisted_cookie():
+    components.html(
+        f"<script>document.cookie = "
+        f"\"{PERSIST_COOKIE_NAME}=; Max-Age=0; Path=/; SameSite=Lax; Secure\";</script>",
+        height=0,
+    )
+
+
+def _persist_if_changed(access_token, refresh_token):
+    """Only writes the cookie when the token pair actually differs from
+    what the browser is already known to hold -- a fresh login, or a
+    genuine token rotation. A normal rerun where set_session() returns the
+    same still-valid tokens is a no-op tuple comparison, not a cookie
+    write, which is what keeps tab/filter/widget interactions from
+    repeatedly rewriting the cookie."""
+    _new_sig = (access_token, refresh_token)
+    if st.session_state.get("_persisted_token_sig") == _new_sig:
+        return
+    _payload = _encode_persisted_session(access_token, refresh_token)
+    if _payload is None:
+        return
+    _write_persisted_cookie(_payload)
+    st.session_state["_persisted_token_sig"] = _new_sig
+# A fresh Client (and therefore a fresh, session-less GoTrueClient) is
+# created on every Streamlit rerun -- Streamlit re-executes this entire
+# script top-to-bottom on every interaction (tab switch, filter change,
+# button click, st.rerun()). Supabase auth state must be re-attached to
+# *this rerun's* client every single time, not just once per browser
+# session, otherwise any later authenticated call (e.g. auth.get_user())
+# hits a client with no session and raises, aborting the script before
+# run_app() ever executes -- which looks exactly like an unexpected sign-out.
+#
+# auto_refresh_token=False: gotrue-py's set_session() unconditionally starts
+# a background threading.Timer to proactively refresh the token before it
+# expires (see supabase_auth._sync.gotrue_client._save_session ->
+# _start_auto_refresh_token), even when the token wasn't actually expired
+# this call. Since a brand-new client is created every rerun above, that
+# timer -- and the whole client object it keeps alive via its closure -- is
+# never cancelled; every single rerun leaks one more live background thread.
+# This is redundant here anyway: set_session() already re-validates and
+# refreshes the token synchronously on every rerun (see the restore block
+# below), which is the correct refresh mechanism for Streamlit's
+# recreate-everything-per-rerun model. Disabling the client's own
+# self-scheduled background refresh removes the leak with no loss of
+# freshness or security.
+supabase: Client = create_client(
+    SUPABASE_URL, SUPABASE_ANON_KEY, options=ClientOptions(auto_refresh_token=False),
+)
 st.session_state.setdefault("sb_access_token", None)
 st.session_state.setdefault("sb_refresh_token", None)
 st.session_state.setdefault("sb_session", None)
-if (
-    cookies.get("access_token")
-    and cookies.get("refresh_token")
-    and not st.session_state.get("sb_access_token")
-):
-    try:
-        supabase.auth.set_session(
-            access_token=cookies.get("access_token"),
-            refresh_token=cookies.get("refresh_token"),
-        )
-        st.session_state.sb_access_token = cookies.get("access_token")
-        st.session_state.sb_refresh_token = cookies.get("refresh_token")
-    except Exception as e:
-        st.warning(f"Could not restore login session: {e}")
-def save_session(sess, remember=False):
+st.session_state.setdefault("_persisted_token_sig", None)
+
+
+def save_session(sess):
     st.session_state.sb_session = sess
     st.session_state.sb_access_token = sess.access_token
     st.session_state.sb_refresh_token = sess.refresh_token
-    if remember:
-        cookies["access_token"] = sess.access_token
-        cookies["refresh_token"] = sess.refresh_token
-        cookies.save()
+
+
 def clear_session():
     st.session_state.sb_session = None
     st.session_state.sb_access_token = None
     st.session_state.sb_refresh_token = None
-    cookies.clear()
-    cookies.save()
-authed = bool(
-    st.session_state.sb_access_token and st.session_state.sb_refresh_token
-)
+    if st.session_state.get("_persisted_token_sig") is not None:
+        _clear_persisted_cookie()
+        st.session_state["_persisted_token_sig"] = None
+
+
+# st.session_state persists across normal reruns within this browser
+# session (tab switches, filter changes, st.rerun()). If it's empty --
+# a brand-new browser session, e.g. after closing and reopening the
+# browser -- fall back to the persisted cookie (native read, see
+# _get_fernet/_decode_persisted_session above). The cookie's own token
+# pair is recorded as the known-persisted baseline *before* attempting
+# set_session() below, so if set_session() returns that exact same pair
+# unchanged (the common case -- token wasn't actually expired), no cookie
+# write happens; a write only happens if set_session() actually rotates
+# the pair (see _persist_if_changed).
+_restore_access = st.session_state.get("sb_access_token")
+_restore_refresh = st.session_state.get("sb_refresh_token")
+if not (_restore_access and _restore_refresh):
+    _cookie_tokens = _decode_persisted_session(st.context.cookies.get(PERSIST_COOKIE_NAME))
+    if _cookie_tokens:
+        _restore_access, _restore_refresh = _cookie_tokens
+        st.session_state["_persisted_token_sig"] = _cookie_tokens
+
+authed = False
+if _restore_access and _restore_refresh:
+    try:
+        _res = supabase.auth.set_session(
+            access_token=_restore_access,
+            refresh_token=_restore_refresh,
+        )
+        _sess = getattr(_res, "session", None)
+        if not _sess:
+            raise RuntimeError("set_session returned no session")
+        # set_session transparently refreshes an expired access token using
+        # the refresh token -- write back whatever came out so session_state
+        # stays current instead of re-refreshing on every later rerun.
+        save_session(_sess)
+        _persist_if_changed(_sess.access_token, _sess.refresh_token)
+        authed = True
+    except (AuthRetryableError, httpx.TransportError):
+        # set_session() calls Supabase's /user endpoint synchronously on
+        # EVERY rerun (even when the access token is still valid, not just
+        # when refreshing) to validate it -- see gotrue-py's set_session,
+        # the "not expired" branch calls self.get_user(access_token). A
+        # transient failure of that single network call (a timeout, a
+        # brief 5xx/gateway error, a DNS/connection hiccup -- gotrue-py
+        # itself classifies these as AuthRetryableError; raw connection/
+        # timeout errors aren't even wrapped and surface as httpx errors)
+        # is NOT proof the stored token is actually invalid. Leave the
+        # stored tokens (and the persisted cookie) alone here; this rerun
+        # just renders as signed-out, and the very next interaction
+        # retries set_session() with the same tokens, self-healing without
+        # forcing a re-login or destroying an otherwise-valid cookie.
+        authed = False
+    except Exception:
+        # A genuine rejection -- the tokens are actually invalid or expired
+        # past refresh, or a real (non-transient) error occurred. Fail
+        # closed: clear the stale session state AND the persisted cookie
+        # (clear_session does both) rather than leaving authed=True paired
+        # with a client that has no session. Same end state as an
+        # explicit logout.
+        clear_session()
+        authed = False
 # =======================
 # BRANDING
 # =======================
@@ -117,12 +291,20 @@ with st.sidebar:
     )
     st.sidebar.divider()
     if authed:
-        user = supabase.auth.get_user()
-        user_email = (
-            getattr(user.user, "email", None)
-            if user and getattr(user, "user", None)
-            else None
-        )
+        # authed already means a session was successfully attached to this
+        # rerun's client above -- this is defense-in-depth against a
+        # transient failure here (e.g. a network blip), not the session
+        # restoration itself. A failure here should not sign the user out;
+        # it just means the email can't be shown this rerun.
+        try:
+            user = supabase.auth.get_user()
+            user_email = (
+                getattr(user.user, "email", None)
+                if user and getattr(user, "user", None)
+                else None
+            )
+        except Exception:
+            user_email = None
         st.success(f"Signed in{f' as {user_email}' if user_email else ''}.")
         col1, col2 = st.columns(2)
         with col1:
@@ -131,9 +313,8 @@ with st.sidebar:
                     supabase.auth.sign_out()
                 except Exception:
                     pass
+                _clear_persisted_cookie()
                 st.session_state.clear()
-                cookies.clear()
-                cookies.save()
                 st.rerun()
     else:
         st.info(
@@ -142,7 +323,6 @@ with st.sidebar:
         with st.form("login_form_sidebar", clear_on_submit=False, border=True):
             email       = st.text_input("Email", key="signin_email_sidebar")
             password    = st.text_input("Password", type="password", key="signin_pw_sidebar")
-            remember_me = st.checkbox("Keep me logged in", value=True)
             submit      = st.form_submit_button("Sign in", use_container_width=True)
         if submit:
             try:
@@ -151,7 +331,8 @@ with st.sidebar:
                 )
                 sess = getattr(res, "session", None)
                 if sess:
-                    save_session(sess, remember=remember_me)
+                    save_session(sess)
+                    _persist_if_changed(sess.access_token, sess.refresh_token)
                     st.success("Signed in successfully.")
                     st.rerun()
                 else:
