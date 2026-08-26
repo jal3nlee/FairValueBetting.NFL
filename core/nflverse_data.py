@@ -296,6 +296,28 @@ def _team_abbr_for(team_full_name: str, teams_df) -> str | None:
         return None
 
 
+def get_nfl_team_names() -> list[tuple[str, str]]:
+    """(full_name, abbr) pairs for every NFL team, sourced from the same
+    already-cached nflreadpy team table (_load_teams(), 24h TTL) used
+    elsewhere in this module — no new fetch. abbr matches exactly what
+    build_prop_leaderboard's result rows carry in "team" (both come from
+    nflreadpy), so this is the correct source for a Team filter against
+    those rows — not core/lineup_data.py's NFL_TEAMS, which uses ESPN's
+    own (sometimes differently-cased/abbreviated) team codes."""
+    teams_df = _load_teams()
+    if teams_df is None:
+        return []
+    try:
+        rows = teams_df.to_dicts()
+    except Exception:
+        return []
+    pairs = {
+        (r.get("team_name"), r.get("team_abbr"))
+        for r in rows if r.get("team_name") and r.get("team_abbr")
+    }
+    return sorted(pairs)
+
+
 def get_player_usage(player_name: str, team_full_name: str, position: str, prior_team_full_name: str | None = None) -> dict:
     if not _NFLVERSE_AVAILABLE:
         return {}
@@ -546,7 +568,16 @@ def _all_player_weekly_rows(season: int) -> list[dict]:
         return []
 
 
-def build_prop_leaderboard(stat_label: str, side: str, line: float, sample_label: str) -> list[dict]:
+def build_prop_leaderboard(stat_label: str, side: str, line: float, sample_label: str, limit: int | None = 10) -> list[dict]:
+    """
+    Returns up to `limit` results (10 by default, matching prior behavior
+    exactly); pass limit=None for the full sorted candidate list, e.g. so
+    a caller can filter (by team/position) before truncating to a top-N
+    for display, rather than filtering an already-truncated top 10 and
+    getting sparse or misleading results. Candidate construction,
+    eligibility, hit-rate calculation, and ranking are unchanged — this
+    only makes the final truncation step optional.
+    """
     season = get_current_season()
     if season is None:
         return []
@@ -597,4 +628,4 @@ def build_prop_leaderboard(stat_label: str, side: str, line: float, sample_label
         })
 
     results.sort(key=lambda r: (r["hit_rate"], r["hits"], r["games"]), reverse=True)
-    return results[:10]
+    return results[:limit] if limit is not None else results

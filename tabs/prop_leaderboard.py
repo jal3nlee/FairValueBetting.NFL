@@ -13,7 +13,7 @@ from core.nflverse_data import (
     PLAYER_SEARCH_EXTRA_STATS, PROP_LABEL_TO_ODDS_MARKET,
     build_prop_leaderboard, get_player_game_log, get_current_season,
     get_usage_samples, get_expanded_season_stats, get_recent_games,
-    LINEUP_USAGE_METRICS, METRIC_LABELS, PERCENT_METRICS,
+    get_nfl_team_names, LINEUP_USAGE_METRICS, METRIC_LABELS, PERCENT_METRICS,
 )
 from core.lineup_data import (
     get_team_game_context, fetch_player_props_for_event, get_consensus_prop_line, NFL_TEAMS,
@@ -66,21 +66,83 @@ def render_leaderboard_view(supabase, now_utc):
     with _c4:
         sample_label = st.selectbox("Sample Size", list(SAMPLE_OPTIONS.keys()), index=1, key="pl_sample")
 
-    _run = st.button("Find Top 10", type="primary", key="pl_run")
+    # Team/Position are lightweight narrowing controls, not query-defining
+    # inputs — they only ever filter an already-fetched, already-ranked
+    # result set locally (see below), never re-trigger the league scan.
+    _f1, _f2, _f3 = st.columns([1.6, 1.6, 1.2])
+    with _f1:
+        _team_pairs = get_nfl_team_names()  # cached nflreadpy team table, no new fetch
+        _team_options = ["All Teams"] + [name for name, _abbr in _team_pairs]
+        _team_choice = st.selectbox("Team", _team_options, key="pl_team")
+    with _f2:
+        # Options scoped to the currently selected prop's own eligible
+        # positions (PROP_POSITION_MAP, unchanged) — e.g. Receiving Yards
+        # offers only WR/TE/RB, never QB. Keying the widget on stat_label
+        # gives each prop its own independent "All Positions" default
+        # instead of carrying over a position that may not be valid for
+        # a newly selected prop.
+        _eligible_positions = PROP_POSITION_MAP.get(stat_label, [])
+        _position_options = ["All Positions"] + _eligible_positions
+        _position_choice = st.selectbox(
+            "Position", _position_options, key=f"pl_position_{stat_label}",
+        )
+    with _f3:
+        st.markdown("<div style='height:1.9rem'></div>", unsafe_allow_html=True)
+        _run = st.button("Find Top 10", type="primary", key="pl_run", use_container_width=True)
+
     st.markdown(f"### {side} {line:g} {stat_label}")
     st.caption(sample_label)
 
-    if not _run:
+    # Prop/Over-Under/Line/Sample define the analysis and are the only
+    # inputs that invalidate a prior search — Team/Position are
+    # deliberately excluded from this query identity (same shape as the
+    # proven MLB pattern), so changing only Team/Position never resets
+    # "has_run" back to the placeholder and never requires another
+    # Find Top 10 press.
+    _query_key = (stat_label, side, line, sample_label)
+    if st.session_state.get("pl_query_key") != _query_key:
+        st.session_state["pl_has_run"] = False
+    if _run:
+        st.session_state["pl_has_run"] = True
+        st.session_state["pl_query_key"] = _query_key
+
+    if not st.session_state.get("pl_has_run"):
         st.info("Set your filters above and click **Find Top 10** to run the search.")
         return
 
     with st.spinner("Scanning current-season player data..."):
-        results = build_prop_leaderboard(stat_label, side, line, sample_label)
+        # limit=None: the full sorted candidate list, so Team/Position can
+        # narrow it BEFORE truncating to a top 10 for display — filtering
+        # an already-truncated top 10 could return sparse/misleading
+        # results for a team or position that didn't happen to place in
+        # the unfiltered league-wide top 10. Candidate construction,
+        # eligibility, hit-rate calculation, and ranking are all unchanged
+        # inside build_prop_leaderboard; only truncation moved here.
+        all_results = build_prop_leaderboard(stat_label, side, line, sample_label, limit=None)
 
-    if not results:
+    if not all_results:
         st.info(
             "No players qualified with a full sample for this stat, line, and sample size. "
             "Try a shorter sample or a different threshold."
+        )
+        return
+
+    # Team/Position filtering: fully local/in-memory over the already-
+    # ranked full candidate list — no new roster/player/API calls, no
+    # rescan. "team" and "position" are already on every result row from
+    # build_prop_leaderboard, so this is pure filtering, not a lookup.
+    results = all_results
+    if _team_choice != "All Teams":
+        _team_abbr = dict(_team_pairs).get(_team_choice)
+        results = [r for r in results if r["team"] == _team_abbr]
+    if _position_choice != "All Positions":
+        results = [r for r in results if r["position"] == _position_choice]
+    results = results[:10]
+
+    if not results:
+        st.info(
+            f"No qualifying {stat_label.lower()} results for {_team_choice} / {_position_choice} "
+            "with the current filters."
         )
         return
 
