@@ -43,7 +43,7 @@ def _fmt_usage_val(v, is_pct):
 
 
 def render_leaderboard_view(supabase, now_utc):
-    _c1, _c2, _c3 = st.columns([1.8, 1.2, 1.2])
+    _c1, _c2, _c3 = st.columns(3)
     with _c1:
         stat_label = st.selectbox("Prop", list(PROP_STAT_MAP.keys()), key="pl_stat")
     with _c2:
@@ -58,7 +58,7 @@ def render_leaderboard_view(supabase, now_utc):
     # positions for the selected prop are still enforced internally by
     # build_prop_leaderboard via PROP_POSITION_MAP (unchanged) — there's
     # just no separate Position narrowing control in this UI.
-    _f1, _f2, _f3 = st.columns([1.6, 2.0, 1.2])
+    _f1, _f2, _f3 = st.columns(3)
     with _f1:
         sample_label = st.selectbox("Sample Size", list(SAMPLE_OPTIONS.keys()), index=1, key="pl_sample")
     with _f2:
