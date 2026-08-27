@@ -43,28 +43,29 @@ def _fmt_usage_val(v, is_pct):
 
 
 def render_leaderboard_view(supabase, now_utc):
-    _c1, _c2, _c3, _c4 = st.columns([1.8, 1.2, 1.2, 1.6])
+    _c1, _c2, _c3 = st.columns([1.8, 1.2, 1.2])
     with _c1:
         stat_label = st.selectbox("Prop", list(PROP_STAT_MAP.keys()), key="pl_stat")
     with _c2:
         side = st.selectbox("Over/Under", ["Over", "Under"], key="pl_side")
     with _c3:
         line = st.number_input("Prop Line", min_value=0.0, value=49.5, step=0.5, key="pl_line")
-    with _c4:
-        sample_label = st.selectbox("Sample Size", list(SAMPLE_OPTIONS.keys()), index=1, key="pl_sample")
 
-    # Team is the only lightweight narrowing control — not a query-defining
-    # input. It only ever filters an already-fetched, already-ranked result
-    # set locally (see below), never re-triggers the league scan. Eligible
+    # Sample Size (query-defining) shares this row with Team, the one
+    # lightweight narrowing control — Team is not a query-defining input.
+    # It only ever filters an already-fetched, already-ranked result set
+    # locally (see below), never re-triggers the league scan. Eligible
     # positions for the selected prop are still enforced internally by
     # build_prop_leaderboard via PROP_POSITION_MAP (unchanged) — there's
     # just no separate Position narrowing control in this UI.
-    _f1, _f2 = st.columns([2.0, 1.2])
+    _f1, _f2, _f3 = st.columns([1.6, 2.0, 1.2])
     with _f1:
+        sample_label = st.selectbox("Sample Size", list(SAMPLE_OPTIONS.keys()), index=1, key="pl_sample")
+    with _f2:
         _team_pairs = get_nfl_team_names()  # cached nflreadpy team table, no new fetch
         _team_options = ["All Teams"] + [name for name, _abbr in _team_pairs]
         _team_choice = st.selectbox("Team", _team_options, key="pl_team")
-    with _f2:
+    with _f3:
         st.markdown("<div style='height:1.9rem'></div>", unsafe_allow_html=True)
         _run = st.button("Find Top 10", type="primary", key="pl_run", use_container_width=True)
 
