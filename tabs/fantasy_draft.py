@@ -23,7 +23,7 @@ def _tight_label(text: str):
 
 
 def render():
-    st.markdown("## Fantasy Draft")
+    st.markdown("## Draft Rankings")
     st.markdown(
         "<div style='opacity:0.7;font-size:0.95rem;margin:0 0 10px 0'>"
         "Compare fantasy football draft rankings and ADP across ESPN, Sleeper, CBS, NFL, RTSports, "

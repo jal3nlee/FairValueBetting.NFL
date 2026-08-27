@@ -16,8 +16,7 @@ from core.data_sources import infer_current_week_index
 from tabs import (
     fair_value_model,
     matchup_center,
-    lineup_comparison,
-    fantasy_draft,
+    fantasy_tools,
     prop_leaderboard,
     sportsbook_screener,
     parlay_builder,
@@ -371,14 +370,15 @@ with st.sidebar.expander("How to use", expanded=False):
    the top EV plays, then lets you pick a Date Range and Market, filter by Expected
    Value and Odds, and compare Best Odds against our Fair Odds estimate.
 2. **Matchup Center** — dig into any individual game's market snapshot and research.
-3. **Lineup Analysis** — research weekly usage, props, game environment, and matchup context for one player, or compare up to four.
-4. **Fantasy Draft** — consensus ADP rankings across platforms, filterable by position.
-5. **Prop Research** — research an individual player's props, season stats, recent
+3. **Fantasy Tools** — Lineup Analysis (research weekly usage, props, game
+   environment, and matchup context for one player, or compare up to four) and
+   Draft Rankings (consensus ADP across platforms, filterable by position).
+4. **Prop Research** — research an individual player's props, season stats, recent
    games, and matchup context directly, or find the top players on the best current
    hit-rate streak for a selected prop.
-6. **Sportsbook Screener** — pure line shopping across every sportsbook.
-7. **Parlay Builder** — build and compare multi-leg parlays across sportsbooks.
-8. **Arbitrage Tracker** — scan current prices for markets where the best price on
+5. **Sportsbook Screener** — pure line shopping across every sportsbook.
+6. **Parlay Builder** — build and compare multi-leg parlays across sportsbooks.
+7. **Arbitrage Tracker** — scan current prices for markets where the best price on
    each side, across different books, guarantees a profit regardless of outcome.
         """
     )
@@ -439,8 +439,7 @@ def run_app():
     tabs = st.tabs([
         "Fair Value Model",
         "Matchup Center",
-        "Lineup Analysis",
-        "Fantasy Draft",
+        "Fantasy Tools",
         "Prop Research",
         "Sportsbook Screener",
         "Parlay Builder",
@@ -451,16 +450,14 @@ def run_app():
     with tabs[1]:
         matchup_center.render(supabase, now_utc, eff_bankroll, eff_kelly)
     with tabs[2]:
-        lineup_comparison.render(supabase, now_utc)
+        fantasy_tools.render(supabase, now_utc)
     with tabs[3]:
-        fantasy_draft.render()
-    with tabs[4]:
         prop_leaderboard.render(supabase, now_utc)
-    with tabs[5]:
+    with tabs[4]:
         sportsbook_screener.render(supabase, now_utc)
-    with tabs[6]:
+    with tabs[5]:
         parlay_builder.render(supabase, now_utc, eff_bankroll, eff_kelly, authed)
-    with tabs[7]:
+    with tabs[6]:
         arbitrage_tracker.render(supabase, now_utc, eff_bankroll, eff_kelly)
 if __name__ == "__main__":
     run_app()
