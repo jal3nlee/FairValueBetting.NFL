@@ -16,10 +16,8 @@ from core.nflverse_data import (
     get_nfl_team_names, LINEUP_USAGE_METRICS, METRIC_LABELS, PERCENT_METRICS,
 )
 from core.lineup_data import (
-    get_team_game_context, fetch_player_props_for_event, get_consensus_prop_line, NFL_TEAMS,
+    get_team_game_context, fetch_player_props_for_event, get_consensus_prop_line,
 )
-
-_ABBR_TO_FULLNAME = {v.upper(): k for k, v in NFL_TEAMS.items()}
 
 SPORTSBOOK_DISPLAY = {
     "fanduel": "FanDuel", "draftkings": "DraftKings", "betmgm": "BetMGM",
@@ -36,17 +34,6 @@ def _fmt_odds(price):
     if price is None:
         return "—"
     return f"+{int(price)}" if price > 0 else str(int(price))
-
-
-def _opponent_for(team_abbr: str, supabase, now_utc):
-    try:
-        full_name = _ABBR_TO_FULLNAME.get(team_abbr)
-        if not full_name:
-            return "—"
-        ctx = get_team_game_context(supabase, full_name, now_utc)
-        return ctx.get("opponent", "—") if ctx else "—"
-    except Exception:
-        return "—"
 
 
 def _fmt_usage_val(v, is_pct):
@@ -66,27 +53,18 @@ def render_leaderboard_view(supabase, now_utc):
     with _c4:
         sample_label = st.selectbox("Sample Size", list(SAMPLE_OPTIONS.keys()), index=1, key="pl_sample")
 
-    # Team/Position are lightweight narrowing controls, not query-defining
-    # inputs — they only ever filter an already-fetched, already-ranked
-    # result set locally (see below), never re-trigger the league scan.
-    _f1, _f2, _f3 = st.columns([1.6, 1.6, 1.2])
+    # Team is the only lightweight narrowing control — not a query-defining
+    # input. It only ever filters an already-fetched, already-ranked result
+    # set locally (see below), never re-triggers the league scan. Eligible
+    # positions for the selected prop are still enforced internally by
+    # build_prop_leaderboard via PROP_POSITION_MAP (unchanged) — there's
+    # just no separate Position narrowing control in this UI.
+    _f1, _f2 = st.columns([2.0, 1.2])
     with _f1:
         _team_pairs = get_nfl_team_names()  # cached nflreadpy team table, no new fetch
         _team_options = ["All Teams"] + [name for name, _abbr in _team_pairs]
         _team_choice = st.selectbox("Team", _team_options, key="pl_team")
     with _f2:
-        # Options scoped to the currently selected prop's own eligible
-        # positions (PROP_POSITION_MAP, unchanged) — e.g. Receiving Yards
-        # offers only WR/TE/RB, never QB. Keying the widget on stat_label
-        # gives each prop its own independent "All Positions" default
-        # instead of carrying over a position that may not be valid for
-        # a newly selected prop.
-        _eligible_positions = PROP_POSITION_MAP.get(stat_label, [])
-        _position_options = ["All Positions"] + _eligible_positions
-        _position_choice = st.selectbox(
-            "Position", _position_options, key=f"pl_position_{stat_label}",
-        )
-    with _f3:
         st.markdown("<div style='height:1.9rem'></div>", unsafe_allow_html=True)
         _run = st.button("Find Top 10", type="primary", key="pl_run", use_container_width=True)
 
@@ -94,11 +72,10 @@ def render_leaderboard_view(supabase, now_utc):
     st.caption(sample_label)
 
     # Prop/Over-Under/Line/Sample define the analysis and are the only
-    # inputs that invalidate a prior search — Team/Position are
-    # deliberately excluded from this query identity (same shape as the
-    # proven MLB pattern), so changing only Team/Position never resets
-    # "has_run" back to the placeholder and never requires another
-    # Find Top 10 press.
+    # inputs that invalidate a prior search — Team is deliberately
+    # excluded from this query identity (same shape as the proven MLB
+    # pattern), so changing only Team never resets "has_run" back to the
+    # placeholder and never requires another Find Top 10 press.
     _query_key = (stat_label, side, line, sample_label)
     if st.session_state.get("pl_query_key") != _query_key:
         st.session_state["pl_has_run"] = False
@@ -127,38 +104,46 @@ def render_leaderboard_view(supabase, now_utc):
         )
         return
 
-    # Team/Position filtering: fully local/in-memory over the already-
-    # ranked full candidate list — no new roster/player/API calls, no
-    # rescan. "team" and "position" are already on every result row from
-    # build_prop_leaderboard, so this is pure filtering, not a lookup.
+    # Team filtering: fully local/in-memory over the already-ranked full
+    # candidate list — no new roster/player/API calls, no rescan. "team"
+    # is already on every result row from build_prop_leaderboard, so this
+    # is pure filtering, not a lookup.
     results = all_results
+    _team_abbr_by_name = dict(_team_pairs)
     if _team_choice != "All Teams":
-        _team_abbr = dict(_team_pairs).get(_team_choice)
+        _team_abbr = _team_abbr_by_name.get(_team_choice)
         results = [r for r in results if r["team"] == _team_abbr]
-    if _position_choice != "All Positions":
-        results = [r for r in results if r["position"] == _position_choice]
     results = results[:10]
 
     if not results:
-        st.info(
-            f"No qualifying {stat_label.lower()} results for {_team_choice} / {_position_choice} "
-            "with the current filters."
-        )
+        st.info(f"No qualifying {stat_label.lower()} results for {_team_choice} with the current filters.")
         return
+
+    # Full team names for display only — reuses the same already-fetched
+    # (full_name, abbr) pairs the Team filter dropdown is built from, no
+    # new lookup. Internal filtering above still compares abbreviations,
+    # matching the "team" field build_prop_leaderboard actually returns.
+    _team_name_by_abbr = {abbr: name for name, abbr in _team_pairs}
 
     avg_label = PROP_AVG_LABEL.get(stat_label, "Avg")
     rows = []
     for i, r in enumerate(results, 1):
-        opp = _opponent_for(r["team"], supabase, now_utc)
         rows.append({
-            "Rank": i, "Player": r["player"], "Team": r["team"], "Pos": r["position"], "Opp": opp,
+            "Rank": i, "Player": r["player"],
+            "Team": _team_name_by_abbr.get(r["team"], r["team"]),
             "Hit Rate": r["hit_rate"] / 100.0, "Record": f"{r['hits']} / {r['games']}", avg_label: r["avg"],
         })
 
     df = pd.DataFrame(rows)
     st.dataframe(
         df, use_container_width=True, hide_index=True,
-        column_config={"Hit Rate": st.column_config.ProgressColumn("Hit Rate", format="%.0f%%", min_value=0.0, max_value=1.0)},
+        # "percent" (not a printf spec like "%.0f%%") is what actually
+        # scales this 0-1 fraction into percentage text — a printf format
+        # just prints the raw fraction with a literal "%" appended, so 0.4
+        # was rendering as "0%" instead of "40%". Same underlying value
+        # still drives both the bar fill (min/max 0-1) and the displayed
+        # number — same fix already shipped in MLB's equivalent leaderboard.
+        column_config={"Hit Rate": st.column_config.ProgressColumn("Hit Rate", format="percent", min_value=0.0, max_value=1.0)},
     )
     if any(r["pushes"] > 0 for r in results):
         st.caption("Pushes (exact line matches) are excluded from both hits and the sample denominator.")
