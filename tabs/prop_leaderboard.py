@@ -245,13 +245,18 @@ def _render_prop_analysis(player: dict, ctx: dict, supabase, now_utc):
     if _full_log:
         st.markdown("<div style='margin-top:14px'></div>", unsafe_allow_html=True)
         st.markdown("### Recent Prop Results")
-        st.caption("Line = your selected research line, not a historical sportsbook line.")
         _cur_season = get_current_season()
         _log_rows = []
         for g in _full_log[:10]:
             _wk = f"W{g['week']}" if g.get("season") == _cur_season else f"W{g['week']} {g.get('season')}"
             _log_rows.append({
-                "Week": _wk, "Opponent": g["opponent"], _picked_label: g["value"], "Line": _threshold,
+                # "Line" intentionally not repeated per row here — the
+                # selected research line (_threshold) is already shown in
+                # the Prop Line control above and in the Prop Hit Rate
+                # header, so a column showing the same identical value on
+                # every row would just be redundant clutter. _threshold
+                # itself is untouched and still drives Result below.
+                "Week": _wk, "Opponent": g["opponent"], _picked_label: g["value"],
                 "Result": ("Over" if g["value"] > _threshold else "Push" if g["value"] == _threshold else "Under"),
             })
         st.dataframe(pd.DataFrame(_log_rows), use_container_width=True, hide_index=True)
