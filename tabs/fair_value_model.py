@@ -7,6 +7,9 @@ from core.odds_math import (
 )
 from core.pipeline import MARKETS, run_market_pipeline, PipelineTrace
 from core.data_sources import fetch_market_lines, filter_by_window, get_date_window
+from core.nfl_prop_market_config import PROP_MARKETS
+from core.nfl_prop_pipeline import run_prop_market_pipeline
+from core.nfl_prop_data_sources import fetch_prop_market_lines, get_upcoming_prop_event_ids
 from tabs import market_movers
 
 
@@ -101,6 +104,75 @@ def _dispersion_label(row) -> str:
     return f"{float(std_dev) * 100:.1f}%"
 
 
+def _prop_fair_odds(row):
+    # PROP_MARKETS' side_a is always "over" (label_a="Over") — mi_fair_odds_a/
+    # mi_fair_odds_b are attached at the group level, not per side, so the
+    # matching one is selected the same way _recompute_row does for game
+    # markets above: by which side this specific row represents.
+    return row.get("mi_fair_odds_a") if row.get("Side") == "Over" else row.get("mi_fair_odds_b")
+
+
+def _render_player_props(supabase, now_utc, eff_bankroll, eff_kelly, debug_mode=False):
+    """
+    Player Props view — Phase 1. Runs the exact same generic fair-value
+    engine as Game Markets (core/pipeline.py::_consensus_engine,
+    best_prices, build_market_intelligence, format_display_df, all
+    imported unmodified inside core/nfl_prop_pipeline.py) against the
+    dedicated player_prop_snapshots/player_prop_lines tables — entirely
+    separate storage and read path from Game Markets, so nothing here can
+    affect that table's ingestion, pipeline call, or display above.
+    """
+    _pr1, _pr2 = st.columns(2)
+    with _pr1:
+        _window_choice = st.selectbox(
+            "Date Range", ["Today", "This Week", "Next 7 Days"], index=1, key="fvm_prop_window_choice",
+        )
+    window_start, window_end, _sport_keys, caption_label = get_date_window(now_utc, _window_choice)
+
+    all_prop_display = []
+    with st.spinner("Loading NFL player props..."):
+        event_ids = get_upcoming_prop_event_ids(supabase, window_start.isoformat(), window_end.isoformat())
+        for mkt_key, mkt_cfg in PROP_MARKETS.items():
+            if not event_ids:
+                continue
+            raw = fetch_prop_market_lines(supabase, event_ids, mkt_key)
+            raw_filtered = filter_by_window(raw, window_start, window_end)
+            df = run_prop_market_pipeline(
+                raw_lines=raw_filtered, cfg=mkt_cfg, bankroll=eff_bankroll, kelly=eff_kelly,
+                min_ev=0.0, min_fair_pct=0.0, show_all=True,
+            )
+            if not df.empty:
+                all_prop_display.append(df)
+
+    df_props = pd.concat(all_prop_display, ignore_index=True) if all_prop_display else pd.DataFrame()
+
+    if debug_mode:
+        st.caption(f"debug: player props — {len(event_ids)} event(s) in window, {len(df_props)} row(s) after pricing")
+
+    if df_props.empty:
+        st.info(f"No player prop data found for {caption_label}.")
+        return
+
+    with _pr2:
+        _prop_opts = ["All"] + sorted(df_props["Market"].dropna().unique().tolist())
+        _prop_sel = st.selectbox("Prop", _prop_opts, key="fvm_prop_mkt")
+
+    _pfilt = df_props.copy()
+    if _prop_sel != "All":
+        _pfilt = _pfilt[_pfilt["Market"] == _prop_sel]
+    _pfilt["Fair Odds"] = _pfilt.apply(lambda r: fmt_odds(_prop_fair_odds(r)), axis=1)
+    _pfilt["Consensus Confidence"] = _pfilt.get("mi_rating_label", "—")
+    _pfilt = _pfilt.sort_values("_ev_raw", ascending=False).reset_index(drop=True) if "_ev_raw" in _pfilt.columns \
+        else _pfilt.reset_index(drop=True)
+
+    _prop_cols = ["Game", "Player", "Market", "Line", "Side", "Best Book", "Best Odds", "Fair Odds",
+                  "EV%", "Kelly (u)", "Consensus Confidence"]
+    _prop_display = _pfilt[[c for c in _prop_cols if c in _pfilt.columns]]
+    st.dataframe(_prop_display, use_container_width=True, hide_index=True,
+                 height=min(600, 38 + 35 * len(_prop_display)))
+    st.caption(f"{len(_prop_display)} result{'s' if len(_prop_display) != 1 else ''}")
+
+
 def render(supabase, now_utc, eff_bankroll, eff_kelly, authed, debug_mode=False):
     market_movers.render(supabase, now_utc, eff_bankroll, eff_kelly)
 
@@ -113,6 +185,15 @@ def render(supabase, now_utc, eff_bankroll, eff_kelly, authed, debug_mode=False)
         "Compare our fair odds estimates to the best available sportsbook prices "
         "to identify positive expected value betting opportunities."
     )
+
+    _view = st.segmented_control(
+        "View", ["Game Markets", "Player Props"], default="Game Markets", key="fvm_view",
+    )
+    if _view is None:
+        _view = "Game Markets"
+    if _view == "Player Props":
+        _render_player_props(supabase, now_utc, eff_bankroll, eff_kelly, debug_mode)
+        return
 
     _format_options = ["American", "Decimal", "Implied %"]
     _current_week_label = "NFL Week X"  # replaced below once window is known

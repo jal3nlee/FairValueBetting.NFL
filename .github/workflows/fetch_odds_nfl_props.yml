@@ -1,0 +1,36 @@
+name: Fetch NFL Player Props
+
+on:
+  schedule:
+    # Same 5-minute floor as fetch_odds_nfl.yml (GitHub Actions' shortest
+    # supported scheduled interval). fetch_odds_nfl_props.py self-throttles
+    # per event against its own tiered pregame cadence (hourly far out,
+    # 15min approaching, 5min in the final 30 minutes before kickoff, and
+    # skipped entirely once an event has kicked off) — most invocations of
+    # this workflow will find no event due for a refresh and exit after a
+    # single cheap Supabase read, with no Odds API call.
+    - cron: "*/5 * * * *"
+  workflow_dispatch:
+
+# Own concurrency group, distinct from fetch-nfl-odds — this workflow
+# writes only to the dedicated player_prop_* tables and must never be
+# serialized behind (or block) the existing game-market ingestion run.
+concurrency:
+  group: fetch-nfl-props
+  cancel-in-progress: false
+
+jobs:
+  fetch-props:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - run: pip install requests supabase
+      - name: Run prop fetch script
+        env:
+          ODDS_API_KEY: ${{ secrets.ODDS_API_KEY }}
+          SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+          SUPABASE_KEY: ${{ secrets.SUPABASE_KEY }}
+        run: python fetch_odds_nfl_props.py
