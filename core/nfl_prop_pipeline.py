@@ -199,4 +199,13 @@ def run_prop_market_pipeline(raw_lines: pd.DataFrame, cfg: MarketConfig, bankrol
     if df_disp.empty:
         return pd.DataFrame()
 
-    return format_display_df(df_disp)
+    # format_display_df (imported unmodified from core/pipeline.py) drops
+    # "_ev_raw" as part of its normal, protected formatting contract — by
+    # design, for the game-market callers that already recompute their own
+    # EV against a filtered book set (see _recompute_row in
+    # tabs/fair_value_model.py). The player-prop view has no such recompute
+    # step and needs "_ev_raw" to sort by EV, so it's re-attached here,
+    # after formatting, without touching format_display_df itself.
+    formatted = format_display_df(df_disp)
+    formatted["_ev_raw"] = df_disp["_ev_raw"]
+    return formatted
