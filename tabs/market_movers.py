@@ -2,9 +2,12 @@
 import pandas as pd
 import streamlit as st
 
-from core.odds_math import parse_iso_dt_utc, EASTERN
+from core.odds_math import parse_iso_dt_utc, EASTERN, fmt_odds
 from core.pipeline import MARKETS, run_market_pipeline
 from core.data_sources import fetch_market_lines, filter_by_window, get_date_window, infer_current_week_index
+from core.nfl_prop_market_config import PROP_MARKETS
+from core.nfl_prop_pipeline import run_prop_market_pipeline
+from core.nfl_prop_data_sources import fetch_prop_market_lines, get_upcoming_prop_event_ids
 
 
 def _sc_name(book: str) -> str:
@@ -43,6 +46,37 @@ def _logo_url(team_name: str) -> str | None:
     return f"https://a.espncdn.com/i/teamlogos/nfl/500/{abbr}.png" if abbr else None
 
 
+def _mm_fair_odds_str(row, is_prop: bool) -> str:
+    """Fair odds for this row's own Pick/Side, matching the same
+    pick_is_a selection already used by tabs/fair_value_model.py's
+    _recompute_row/_recompute_prop_row — mi_fair_odds_a/mi_fair_odds_b are
+    attached at the game/group level by build_market_intelligence
+    (unmodified, protected), not recalculated here."""
+    if is_prop:
+        pick_is_a = row.get("Side") == "Over"
+    else:
+        pick_label = row.get("Pick", "")
+        game = row.get("Game", "")
+        home_team = game.split(" vs ")[0] if isinstance(game, str) and " vs " in game else None
+        pick_is_a = pick_label == "Over" if pick_label in ("Over", "Under") else pick_label == home_team
+    fair_val = row.get("mi_fair_odds_a") if pick_is_a else row.get("mi_fair_odds_b")
+    return fmt_odds(int(fair_val)) if fair_val is not None and pd.notna(fair_val) else "—"
+
+
+def _mm_prop_bet_label(row) -> str:
+    """Mirrors tabs/fair_value_model.py::_prop_bet_label — duplicated
+    locally rather than cross-imported, matching this codebase's existing
+    per-tab-private-helper convention (see _sc_name above, and CLAUDE.md's
+    note on the duplicated sportsbook-display-name pattern)."""
+    player = row.get("Player", "—")
+    side = row.get("Side", "")
+    line = row.get("Line")
+    has_line = pd.notna(line) and str(line).strip()
+    market = row.get("Market", "")
+    line_part = f" {line}" if has_line else ""
+    return f"{player} {side}{line_part} {market}".replace("  ", " ").strip()
+
+
 def render(supabase, now_utc, eff_bankroll, eff_kelly):
     # ── This-week data — independent of the Fair Value Model's Date Range.
     # NFL games cluster on Thu/Sun/Mon, so a literal "Today" window (the
@@ -70,6 +104,33 @@ def render(supabase, now_utc, eff_bankroll, eff_kelly):
         if any(not df.empty for df in _week_display.values())
         else pd.DataFrame()
     )
+
+    # ── Player Props for the same week window — additive to Game Markets,
+    # never a dependency: any failure here (no data yet, ingestion not run,
+    # malformed rows) degrades to "no prop plays" without affecting Game
+    # Markets' own Top EV Plays below. Calls the exact same
+    # PROP_MARKETS/run_prop_market_pipeline path the Fair Value Model's
+    # Player Props view uses (core/nfl_prop_pipeline.py, unmodified) — not
+    # a second, independent EV calculation.
+    df_props_week = pd.DataFrame()
+    try:
+        _prop_event_ids = get_upcoming_prop_event_ids(supabase, _week_start.isoformat(), _week_end.isoformat())
+        _prop_frames = []
+        for _pmkt_key, _pmkt_cfg in PROP_MARKETS.items():
+            if not _prop_event_ids:
+                break
+            _praw = fetch_prop_market_lines(supabase, _prop_event_ids, _pmkt_key)
+            _praw_filtered = filter_by_window(_praw, _week_start, _week_end)
+            _pdf = run_prop_market_pipeline(
+                raw_lines=_praw_filtered, cfg=_pmkt_cfg, bankroll=eff_bankroll, kelly=eff_kelly,
+                min_ev=0.0, min_fair_pct=0.0, show_all=True,
+            )
+            if not _pdf.empty:
+                _prop_frames.append(_pdf)
+        if _prop_frames:
+            df_props_week = pd.concat(_prop_frames, ignore_index=True)
+    except Exception:
+        df_props_week = pd.DataFrame()
 
     with st.expander("Market Movers", expanded=True):
         st.caption(
@@ -114,57 +175,82 @@ def render(supabase, now_utc, eff_bankroll, eff_kelly):
         st.divider()
 
         # ── Top EV Plays ─────────────────────────────────────
+        # Combines Game Markets and Player Props into one ranked list —
+        # both are read from their own existing, protected pipelines
+        # (run_market_pipeline / run_prop_market_pipeline) and only
+        # normalized here into a common minimal shape for ranking/display;
+        # no EV/Fair Odds is recalculated independently for either.
         st.markdown("**This Week's Top EV Plays**")
         st.caption(
             "The three highest expected value betting opportunities identified by "
-            f"the Fair Value Model for {_week_label.lower()}."
+            f"the Fair Value Model for {_week_label.lower()}, across game markets and player props."
         )
 
-        if df_week.empty:
+        _combined_plays = []
+
+        if not df_week.empty:
+            _ev_col = pd.to_numeric(df_week["EV%"].astype(str).str.replace("%", "", regex=False), errors="coerce")
+            for _, _r in df_week.assign(_ev_num=_ev_col).loc[lambda d: d["_ev_num"] > 0].iterrows():
+                _combined_plays.append({
+                    "_ev_num": _r["_ev_num"], "_is_prop": False,
+                    "Game": _r.get("Game", "—"), "Market": _r.get("Market", "—"), "Pick": _r.get("Pick", "—"),
+                    "Best Book": _r.get("Best Book", "—"),
+                    "Best Odds (Fair)": f"{_r.get('Best Odds', '—')} ({_mm_fair_odds_str(_r, False)})",
+                    "EV%": _r.get("EV%", "—"),
+                })
+
+        if not df_props_week.empty:
+            _pev_col = pd.to_numeric(df_props_week["EV%"].astype(str).str.replace("%", "", regex=False), errors="coerce")
+            for _, _r in df_props_week.assign(_ev_num=_pev_col).loc[lambda d: d["_ev_num"] > 0].iterrows():
+                _combined_plays.append({
+                    "_ev_num": _r["_ev_num"], "_is_prop": True,
+                    "Game": _r.get("Game", "—"), "Bet": _mm_prop_bet_label(_r),
+                    "Best Book": _r.get("Best Book", "—"),
+                    "Best Odds (Fair)": f"{_r.get('Best Odds', '—')} ({_mm_fair_odds_str(_r, True)})",
+                    "EV%": _r.get("EV%", "—"),
+                })
+
+        # Rank descending across the combined pool — no reserved slots per
+        # category, matching how this section already ranked game markets
+        # alone before props were added.
+        _top_ev = sorted(_combined_plays, key=lambda p: p["_ev_num"], reverse=True)[:3]
+
+        if not _top_ev:
             st.info("No positive EV opportunities were identified at this time.")
         else:
-            _ev_col = pd.to_numeric(df_week["EV%"].astype(str).str.replace("%", "", regex=False), errors="coerce")
-            _top_ev = (
-                df_week.assign(_ev_num=_ev_col)
-                .loc[lambda d: d["_ev_num"] > 0]
-                .sort_values("_ev_num", ascending=False)
-                .head(3)
-                .reset_index(drop=True)
-            )
+            for _p in _top_ev:
+                _game = _p.get("Game", "—")
+                _teams = _game.split(" vs ") if isinstance(_game, str) else []
+                _home_team = _teams[0] if len(_teams) == 2 else None
+                _away_team = _teams[1] if len(_teams) == 2 else None
+                _away_logo = _logo_url(_away_team) if _away_team else None
+                _home_logo = _logo_url(_home_team) if _home_team else None
 
-            if _top_ev.empty:
-                st.info("No positive EV opportunities were identified at this time.")
-            else:
-                for _, _r in _top_ev.iterrows():
-                    _game = _r.get("Game", "—")
-                    _teams = _game.split(" vs ") if isinstance(_game, str) else []
-                    _home_team = _teams[0] if len(_teams) == 2 else None
-                    _away_team = _teams[1] if len(_teams) == 2 else None
-                    _away_logo = _logo_url(_away_team) if _away_team else None
-                    _home_logo = _logo_url(_home_team) if _home_team else None
-
-                    with st.container(border=True):
-                        if _away_logo and _home_logo:
-                            st.markdown(
-                                f"<img src='{_away_logo}' width='22' style='vertical-align:middle;margin-right:5px'/>"
-                                f"**{_away_team}** @ "
-                                f"<img src='{_home_logo}' width='22' style='vertical-align:middle;margin:0 5px'/>"
-                                f"**{_home_team}**",
-                                unsafe_allow_html=True,
-                            )
-                        else:
-                            st.markdown(f"**{_game}**")
-
-                        st.caption(f"{_r.get('Market', '—')} · Pick: {_r.get('Pick', '—')}")
-
-                        st.dataframe(
-                            pd.DataFrame([{
-                                "Best Book": _sc_name(_r.get("Best Book", "—")),
-                                "Best Odds": _r.get("Best Odds", "—"),
-                                "EV%": _r.get("EV%", "—"),
-                            }]),
-                            use_container_width=True, hide_index=True, height=38 + 35,
+                with st.container(border=True):
+                    if _away_logo and _home_logo:
+                        st.markdown(
+                            f"<img src='{_away_logo}' width='22' style='vertical-align:middle;margin-right:5px'/>"
+                            f"**{_away_team}** @ "
+                            f"<img src='{_home_logo}' width='22' style='vertical-align:middle;margin:0 5px'/>"
+                            f"**{_home_team}**",
+                            unsafe_allow_html=True,
                         )
+                    else:
+                        st.markdown(f"**{_game}**")
+
+                    if _p["_is_prop"]:
+                        st.caption(_p.get("Bet", "—"))
+                    else:
+                        st.caption(f"{_p.get('Market', '—')} · Pick: {_p.get('Pick', '—')}")
+
+                    st.dataframe(
+                        pd.DataFrame([{
+                            "Best Book": _sc_name(_p.get("Best Book", "—")),
+                            "Best Odds": _p.get("Best Odds (Fair)", "—"),
+                            "EV%": _p.get("EV%", "—"),
+                        }]),
+                        use_container_width=True, hide_index=True, height=38 + 35,
+                    )
 
             st.caption("See the full list of positive EV opportunities below.")
 

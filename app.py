@@ -268,7 +268,7 @@ if FAVICON_PATH:
     except Exception:
         favicon_img = None
 st.set_page_config(
-    page_title="Fair Value Betting",
+    page_title="Fair Value Betting · NFL",
     page_icon=(favicon_img if favicon_img else "🏈"),
     layout="wide",
     initial_sidebar_state="expanded",
@@ -282,7 +282,7 @@ with st.sidebar:
     if LOGO_PATH:
         st.image(str(LOGO_PATH), width=SIDEBAR_W)
     else:
-        st.title("Fair Value Betting")
+        st.title("Fair Value Betting · NFL")
     st.markdown(
         "[fairvaluebetting.com](https://fairvaluebetting.com)  ·  "
         "⚾ [MLB](https://mlb.fairvaluebetting.com)  ·  "
