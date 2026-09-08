@@ -107,18 +107,28 @@ def render_nfl_player_card(
                     f"{player.get('position','')} · {team_abbr}</div>",
                     unsafe_allow_html=True,
                 )
-                if opp_line:
-                    st.markdown(
-                        f"<div style='opacity:0.6;font-size:0.85rem;margin-top:2px'>{opp_line}</div>",
-                        unsafe_allow_html=True,
-                    )
-
-        with _right_col:
-            if season_stats:
+                # Always reserve this line (falls back to the same "—"
+                # missing-value convention used elsewhere) rather than
+                # omitting it — otherwise a player with no context data
+                # renders a visibly shorter card next to one that has it.
                 st.markdown(
-                    f"<div style='opacity:0.6;font-size:0.78rem;font-weight:600;letter-spacing:0.03em;"
-                    f"text-transform:uppercase;margin-bottom:4px'>{season_year} Season Stats</div>",
+                    f"<div style='opacity:0.6;font-size:0.85rem;margin-top:2px'>{opp_line or '—'}</div>",
                     unsafe_allow_html=True,
                 )
+
+        with _right_col:
+            # Same reasoning as opp_line above: always render the "Season
+            # Stats" heading and reserve its row, so two compared cards
+            # stay the same height/structure even when one player has no
+            # stats yet -- the missing side gets the existing caption
+            # convention instead of an empty column.
+            st.markdown(
+                f"<div style='opacity:0.6;font-size:0.78rem;font-weight:600;letter-spacing:0.03em;"
+                f"text-transform:uppercase;margin-bottom:4px'>{season_year} Season Stats</div>",
+                unsafe_allow_html=True,
+            )
+            if season_stats:
                 _df = pd.DataFrame([{s["label"]: s["value"] for s in season_stats}])
                 st.dataframe(_df, use_container_width=True, hide_index=True)
+            else:
+                st.caption("No season stats available yet.")

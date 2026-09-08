@@ -125,12 +125,17 @@ def render_usage_role(enriched: list[dict], names: list[str], allow_mixed_positi
             _rows.append(row)
         st.dataframe(pd.DataFrame(_rows), use_container_width=True, hide_index=True)
     else:
+        # Grouped by metric (Targets / Target Share / Receptions / ...),
+        # each with its Season/Last 5/Last 3 rows directly beneath it --
+        # the metric label is shown once per group (blank on the two rows
+        # below it) rather than repeated on every row, so related rows read
+        # as one visual block instead of a flat, repetitive list.
         _rows = []
         for m in metrics:
             is_pct = m in PERCENT_METRICS
             label = METRIC_LABELS.get(m, m)
-            for wkey, wlabel in [("season", "Season"), ("last5", "Last 5"), ("last3", "Last 3")]:
-                row = [f"{label} — {wlabel}"]
+            for idx, (wkey, wlabel) in enumerate([("season", "Season"), ("last5", "Last 5"), ("last3", "Last 3")]):
+                row = [label if idx == 0 else "", wlabel]
                 for p in enriched:
                     if mixed and m not in LINEUP_USAGE_METRICS.get(p["position"], []):
                         row.append("—")  # metric doesn't apply to this player's own position
@@ -138,23 +143,41 @@ def render_usage_role(enriched: list[dict], names: list[str], allow_mixed_positi
                     w = usage_by_player.get(p["name"], {}).get(m, {}).get(wkey, {})
                     row.append(_fmt_val(w.get("value"), is_pct))
                 _rows.append(row)
-        st.dataframe(pd.DataFrame(_rows, columns=["Metric"] + names), use_container_width=True, hide_index=True)
+        st.dataframe(pd.DataFrame(_rows, columns=["Metric", "Window"] + names), use_container_width=True, hide_index=True)
     st.caption("Usage data: nflverse — current season only.")
 
 
 def render_recent_games(enriched: list[dict]):
     _section_heading("Recent Games")
-    _any = False
+    _with_games = []
     for p in enriched:
         games = get_recent_games(p["name"], p["team"], p["position"], n=5)
-        if not games:
-            continue
-        _any = True
-        if len(enriched) > 1:
-            st.markdown(f"**{p['name']}**")
-        st.dataframe(pd.DataFrame(games), use_container_width=True, hide_index=True)
-    if not _any:
+        if games:
+            _with_games.append((p, games))
+    if not _with_games:
         st.caption("No current-season game log available yet.")
+        return
+
+    def _render_one(p, games):
+        if len(enriched) > 1:
+            st.markdown(
+                f"<div style='font-size:0.85rem;font-weight:700;opacity:0.8;margin:2px 0 4px 0'>{p['name']}</div>",
+                unsafe_allow_html=True,
+            )
+        st.dataframe(pd.DataFrame(games), use_container_width=True, hide_index=True)
+
+    # Side by side for the common two-player comparison, within the
+    # existing page width (columns divide it, not expand it) -- falls
+    # back to stacked, clearly-labeled tables for 3-4 players, or when
+    # only one of the two players actually has game data.
+    if len(enriched) == 2 and len(_with_games) == 2:
+        _c1, _c2 = st.columns(2, gap="small")
+        for _col, (p, games) in zip((_c1, _c2), _with_games):
+            with _col:
+                _render_one(p, games)
+    else:
+        for p, games in _with_games:
+            _render_one(p, games)
 
 
 def render(supabase, now_utc):
@@ -250,10 +273,31 @@ def render(supabase, now_utc):
         or any(p.get("td_fair_prob") is not None for p in enriched)
         or any(p.get("market_implied_fantasy_points") is not None for p in enriched)
     )
-    _section_heading("Player Props")
+    _section_heading("Market Outlook")
     if not _all_markets and not _has_any_prop_value:
         st.caption("Player props are not available yet. Check back closer to kickoff.")
     else:
+        # Market-Implied Fantasy Points is the clearest primary output of
+        # this section -- surfaced first as a compact, neutral (no
+        # better-side color/highlighting) metric card per player, in
+        # larger type than the supporting table below it. The same value
+        # still appears as a normal row in that table for context, not
+        # duplicated logic -- just emphasized once, locally, at the top.
+        st.markdown(
+            "<div style='display:flex;gap:12px;margin-bottom:10px'>" + "".join(
+                f"<div style='flex:1;min-width:0;border:1px solid rgba(128,128,128,0.25);"
+                f"border-radius:10px;padding:10px 14px;'>"
+                f"<div style='opacity:0.6;font-size:0.72rem;font-weight:600;letter-spacing:0.03em;"
+                f"text-transform:uppercase;white-space:nowrap;overflow:hidden;text-overflow:ellipsis'>{name}</div>"
+                f"<div style='font-size:1.6rem;font-weight:700;line-height:1.25;margin-top:2px'>"
+                f"{_fmt_fp(p.get('market_implied_fantasy_points'))}</div>"
+                f"<div style='opacity:0.6;font-size:0.72rem;margin-top:1px'>Market-Implied Fantasy Points</div>"
+                f"</div>"
+                for p, name in zip(enriched, _names)
+            ) + "</div>",
+            unsafe_allow_html=True,
+        )
+
         # Market-Implied Fantasy Points and TD Fair Probability lead the
         # table (most decision-relevant), followed by the individual
         # sportsbook prop lines they're derived from.
