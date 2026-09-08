@@ -423,25 +423,27 @@ def render(supabase, now_utc, eff_bankroll, eff_kelly, authed, debug_mode=False)
     _filt["EV%"] = _filt["_new_ev_num"].apply(fmt_ev)
     _filt["Bet"] = _filt.apply(_bet_full_label, axis=1)
     _filt["Best Odds (Fair)"] = _filt["Best Odds"] + " (" + _filt["Fair Odds"] + ")"
-    _filt["Dispersion"] = _filt.apply(_dispersion_label, axis=1)
+    # Best Book: reuses _new_best_book, already computed in _recompute_row
+    # atomically alongside _new_best_odds (same book-selection loop) — not
+    # independently recalculated or rematched here.
+    _filt["Best Book"] = _filt["_new_best_book"]
 
     with st.expander("FVM", expanded=True):
-        _tbl_cols = ["Bet", "Best Odds (Fair)", "EV%", "Dispersion"]
+        _tbl_cols = ["Bet", "Best Book", "Best Odds (Fair)", "EV%"]
         _tbl_display = _filt[_tbl_cols].reset_index(drop=True)
         st.dataframe(
             _tbl_display, use_container_width=True, hide_index=True,
             height=min(600, 38 + 35 * len(_tbl_display)),
             column_config={
                 "Bet":               st.column_config.TextColumn("Bet"),
+                "Best Book":         st.column_config.TextColumn(
+                    "Best Book", help="The sportsbook offering the Best Odds shown for this bet.",
+                ),
                 "Best Odds (Fair)":  st.column_config.TextColumn(
                     "Best Odds (Fair)",
                     help=f"{TIPS['best_odds']} Fair Odds in parentheses — {TIPS['fair_odds']}",
                 ),
                 "EV%":               st.column_config.TextColumn("EV%", help=TIPS["ev"]),
-                "Dispersion":        st.column_config.TextColumn(
-                    "Dispersion",
-                    help="Standard deviation of anchor-book fair probabilities, shown as a percentage.",
-                ),
             },
         )
         st.caption(
