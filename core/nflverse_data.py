@@ -159,31 +159,50 @@ def _norm_name(name: str) -> str:
 
 
 @st.cache_data(ttl=6 * 3600, show_spinner=False)
+def _fetch_player_stats(season: int):
+    """Raises on failure so st.cache_data never caches a transient
+    nflreadpy/network failure as if it were a genuine "no stats" result —
+    same pattern/rationale as core/lineup_data.py::get_players_by_team's
+    fix (a season's first load in a session could hit a blip and get
+    stuck returning nothing for the full TTL otherwise)."""
+    return nfl.load_player_stats(seasons=season, summary_level="week")
+
+
 def _load_player_stats(season: int):
     if not _NFLVERSE_AVAILABLE:
         return None
     try:
-        return nfl.load_player_stats(seasons=season, summary_level="week")
+        return _fetch_player_stats(season)
     except Exception:
         return None
 
 
 @st.cache_data(ttl=6 * 3600, show_spinner=False)
+def _fetch_team_stats(season: int):
+    """See _fetch_player_stats above — same failure-isolation rationale."""
+    return nfl.load_team_stats(seasons=season, summary_level="week")
+
+
 def _load_team_stats(season: int):
     if not _NFLVERSE_AVAILABLE:
         return None
     try:
-        return nfl.load_team_stats(seasons=season, summary_level="week")
+        return _fetch_team_stats(season)
     except Exception:
         return None
 
 
 @st.cache_data(ttl=24 * 3600, show_spinner=False)
+def _fetch_teams():
+    """See _fetch_player_stats above — same failure-isolation rationale."""
+    return nfl.load_teams()
+
+
 def _load_teams():
     if not _NFLVERSE_AVAILABLE:
         return None
     try:
-        return nfl.load_teams()
+        return _fetch_teams()
     except Exception:
         return None
 
@@ -208,16 +227,27 @@ def _load_injuries(season: int):
         return None
 
 
+@st.cache_data(ttl=6 * 3600, show_spinner=False)
+def _fetch_current_season() -> int:
+    """See _fetch_player_stats above — same failure-isolation rationale.
+    get_current_season() is called several times per Player Research
+    render (Player Card, Prop Analysis, and — indirectly, via
+    get_usage_samples/get_recent_games/get_player_game_log — Player
+    Context all need it) and again on every unrelated rerun; caching it
+    avoids repeating nfl.get_current_season() for no reason."""
+    return nfl.get_current_season()
+
+
 def get_current_season() -> int:
     if not _NFLVERSE_AVAILABLE:
         return None
     try:
-        season = nfl.get_current_season()
-        if DEBUG_SEASON:
-            st.caption(f"debug: nflreadpy.get_current_season() = {season!r}")
-        return season
+        season = _fetch_current_season()
     except Exception:
         return None
+    if DEBUG_SEASON:
+        st.caption(f"debug: nflreadpy.get_current_season() = {season!r}")
+    return season
 
 
 def _week_label(week, season, current_season):
@@ -282,6 +312,36 @@ def _build_weekly_rows(player_stats, team_stats, player_name: str, team_abbr: st
         return rows
     except Exception:
         return []
+
+
+@st.cache_data(ttl=6 * 3600, show_spinner=False)
+def _weekly_rows_for_player(season: int, player_name: str, team_abbr: str) -> list[dict]:
+    """Memoized per (season, player, team) — get_usage_samples,
+    get_recent_games, and get_player_game_log each independently need
+    this exact result for the same player within a single Player Research
+    render (Player Card, Prop Analysis, and Player Context all call one of
+    them), and again on every unrelated rerun of that page. _load_player_
+    stats/_load_team_stats are already cached, but the per-player
+    filter/to_dicts/derive-fields work in _build_weekly_rows was being
+    redone from scratch on every one of those calls. Caching by the three
+    plain (hashable) identifying values, rather than caching
+    _build_weekly_rows itself keyed on its DataFrame arguments, avoids
+    st.cache_data having to hash the full season DataFrame on every call.
+
+    Raises if the underlying season data isn't available, rather than
+    quietly returning [] — _load_player_stats/_load_team_stats already
+    isolate a transient nflreadpy failure from a cached None (see
+    _fetch_player_stats above), but only if that failure signal actually
+    reaches this function's own st.cache_data decorator as an exception;
+    otherwise a transient blip on the very first call for a player would
+    get cached here as "this player has no rows" for the full TTL.
+    _NFLVERSE_AVAILABLE is already checked before any caller reaches this
+    function, so a None here can only mean the fetch itself failed, not
+    that the package is unavailable."""
+    player_stats = _load_player_stats(season)
+    if player_stats is None:
+        raise RuntimeError(f"player stats unavailable for season {season}")
+    return _build_weekly_rows(player_stats, _load_team_stats(season), player_name, team_abbr)
 
 
 def _team_abbr_for(team_full_name: str, teams_df) -> str | None:
@@ -393,7 +453,7 @@ def get_usage_samples(player_name: str, team_full_name: str, position: str, metr
         team_abbr = _team_abbr_for(team_full_name, teams_df)
         if not team_abbr:
             return {}
-        rows = _build_weekly_rows(_load_player_stats(season), _load_team_stats(season), player_name, team_abbr)
+        rows = _weekly_rows_for_player(season, player_name, team_abbr)
         if not rows:
             return {}
 
@@ -473,7 +533,7 @@ def get_recent_games(player_name: str, team_full_name: str, position: str, n: in
         team_abbr = _team_abbr_for(team_full_name, teams_df)
         if not team_abbr:
             return []
-        rows = _build_weekly_rows(_load_player_stats(season), _load_team_stats(season), player_name, team_abbr)
+        rows = _weekly_rows_for_player(season, player_name, team_abbr)
         if not rows:
             return []
         rows_sorted = sorted(rows, key=lambda r: (r.get("season") or 0, r.get("week") or 0), reverse=True)[:n]
@@ -514,8 +574,7 @@ def get_player_game_log(player_name: str, team_full_name: str, stat_field: str, 
         team_abbr = _team_abbr_for(team_full_name, teams_df)
         if not team_abbr:
             return []
-        stats = _load_player_stats(season)
-        rows = _build_weekly_rows(stats, _load_team_stats(season), player_name, team_abbr)
+        rows = _weekly_rows_for_player(season, player_name, team_abbr)
         if not rows:
             return []
 
