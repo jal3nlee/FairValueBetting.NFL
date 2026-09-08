@@ -99,26 +99,18 @@ def thursday_after_labor_day_utc(year: int) -> datetime:
 def nfl_week_window_utc(week_index: int, now_utc: datetime):
     """Returns (start_utc, end_utc) for the given week index."""
     yr = now_utc.astimezone(EASTERN).year
-    wk1 = thursday_after_labor_day_utc(yr)
-    if week_index == 0:
-        # Preseason: today through the day before Week 1 — never look
-        # backward, or already-played games (e.g. last season's Super
-        # Bowl) can fall inside the window and get shown as upcoming.
-        _local_start = now_utc.astimezone(EASTERN).replace(hour=0, minute=0, second=0, microsecond=0)
-        start = _local_start.astimezone(timezone.utc)
-        end = wk1 - timedelta(seconds=1)
-        return start, end
     start = thursday_after_labor_day_utc(yr) + timedelta(days=7 * (week_index - 1))
     end = start + timedelta(days=5, hours=23, minutes=59, seconds=59)
     return start, end
 
 
 def infer_current_week_index(now_utc: datetime) -> int:
-    """Return 0 before Week 1; otherwise clamp to 1..18."""
+    """Return 1 before Week 1 has started (explicitly surfaces Week 1
+    rather than a separate preseason window); otherwise clamp to 1..18."""
     yr = now_utc.astimezone(EASTERN).year
     wk1 = thursday_after_labor_day_utc(yr)
     if now_utc < wk1:
-        return 0
+        return 1
     weeks = (now_utc - wk1).days // 7 + 1
     return max(1, min(18, weeks))
 
@@ -145,7 +137,7 @@ def get_date_window(now_utc: datetime, window_choice: str):
     window_choice is one of: "Today", "<This Week label>", "Next 7 Days".
     """
     current_week = infer_current_week_index(now_utc)
-    week_label = "NFL Preseason" if current_week == 0 else f"NFL Week {current_week}"
+    week_label = f"NFL Week {current_week}"
 
     if window_choice == "Today":
         now_local = datetime.now(EASTERN)
