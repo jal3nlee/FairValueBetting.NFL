@@ -10,8 +10,6 @@ from core.lineup_data import build_player_comparison, get_team_game_context, PRO
 from core.nflverse_data import get_usage_samples, get_recent_games, LINEUP_USAGE_METRICS, METRIC_LABELS, PERCENT_METRICS
 from core.nfl_player_context import render_opponent_defense_single, render_opponent_defense_multi
 
-ROLES = ["Roster", "Bench", "Waiver"]
-
 
 def _dash(v):
     if v is None or (isinstance(v, float) and pd.isna(v)):
@@ -44,19 +42,18 @@ def _selected_names(exclude_idx: int, n_slots: int) -> set[str]:
     return names
 
 
-def render_player_slot(slot_idx: int, mode: str, n_slots: int, supabase, now_utc):
+def render_player_slot(slot_idx: int, n_slots: int, supabase, now_utc):
     _tight_label(f"Player {slot_idx + 1}")
     _taken = _selected_names(slot_idx, n_slots)
-    _allowed = ["RB", "WR", "TE"] if mode == "FLEX" else ["QB", "RB", "WR", "TE"]
+    # All four positions are always selectable now that there's no mode to
+    # pre-filter by (previously FLEX mode excluded QB from the dropdown) --
+    # the comparison behavior below is inferred from what's actually
+    # selected, not gated at selection time.
+    _allowed = ["QB", "RB", "WR", "TE"]
 
     p = render_nfl_player_search(f"lc_slot_{slot_idx}", allowed_positions=_allowed, taken_names=_taken)
     if not p:
         return None
-
-    if mode == "Waiver":
-        p["role"] = st.selectbox("Role", ROLES, key=f"lc_role_{slot_idx}")
-    else:
-        p["role"] = "Roster"
 
     ctx = get_team_game_context(supabase, p["team"], now_utc)
     p["context"] = ctx
@@ -169,12 +166,8 @@ def render(supabase, now_utc):
         unsafe_allow_html=True,
     )
 
-    _tc1, _tc2, _spacer = st.columns([1.5, 1.5, 3], gap="small")
+    _tc1, _spacer = st.columns([1.5, 4.5], gap="small")
     with _tc1:
-        _tight_label("Mode")
-        _mode = st.segmented_control("Mode", ["Start/Sit", "FLEX", "Waiver"], default="Start/Sit",
-                                      key="lc_mode", label_visibility="collapsed") or "Start/Sit"
-    with _tc2:
         _tight_label("Scoring")
         _scoring = st.segmented_control("Scoring", ["PPR", "Half PPR", "Standard"], default="PPR",
                                          key="lc_scoring", label_visibility="collapsed") or "PPR"
@@ -201,7 +194,7 @@ def render(supabase, now_utc):
     _confirmed_players = []
     for i, col in enumerate(_player_cols):
         with col:
-            p = render_player_slot(i, _mode, _n_slots, supabase, now_utc)
+            p = render_player_slot(i, _n_slots, supabase, now_utc)
             if p:
                 _confirmed_players.append(p)
 
@@ -222,7 +215,18 @@ def render(supabase, now_utc):
 
     st.markdown("<div style='margin-top:6px'></div>", unsafe_allow_html=True)
 
-    _is_flex = _mode == "FLEX"
+    # Automatic same-position vs. mixed-position inference, replacing the
+    # removed FLEX mode toggle: identical positions (including QB vs QB)
+    # get the normal single-position comparison; a mix of ONLY FLEX-
+    # eligible skill positions (RB/WR/TE) automatically gets the FLEX-style
+    # mixed comparison. A mix that includes QB is deliberately NOT treated
+    # as mixed-eligible here -- that combination isn't one of the FLEX-
+    # eligible examples this app has ever supported, so it falls through
+    # to the existing "select players at the same position" restriction
+    # rather than inventing new behavior for it.
+    _positions = {p["position"] for p in enriched}
+    _flex_eligible = {"RB", "WR", "TE"}
+    _allow_mixed_positions = len(_positions) > 1 and _positions <= _flex_eligible
 
     def _row(label, values):
         return [label] + [str(_dash(v)) for v in values]
@@ -275,7 +279,7 @@ def render(supabase, now_utc):
         )
 
     st.markdown("<div style='margin-top:14px'></div>", unsafe_allow_html=True)
-    render_usage_role(enriched, _names, allow_mixed_positions=_is_flex)
+    render_usage_role(enriched, _names, allow_mixed_positions=_allow_mixed_positions)
     st.markdown("<div style='margin-top:14px'></div>", unsafe_allow_html=True)
     render_recent_games(enriched)
     st.markdown("<div style='margin-top:14px'></div>", unsafe_allow_html=True)
@@ -320,5 +324,5 @@ def render(supabase, now_utc):
         )
         render_opponent_defense_multi(
             [{"name": p["name"], "position": p["position"], "opponent": p["context"].get("opponent")} for p in enriched],
-            _scoring, allow_mixed_positions=_is_flex,
+            _scoring, allow_mixed_positions=_allow_mixed_positions,
         )
