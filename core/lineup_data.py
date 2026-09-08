@@ -110,28 +110,38 @@ def espn_search_players(query: str) -> list[dict]:
 
 
 @st.cache_data(ttl=3600, show_spinner=False)
+def _fetch_players_by_team(team_abbr: str) -> list[dict]:
+    """Raises on any transient failure (network error, non-200 status) so
+    st.cache_data never caches that as if it were a genuine roster result
+    — a team whose very first request happens to hit a blip would
+    otherwise get an empty roster stuck in cache for the full TTL. Only
+    a successful response is cached; get_players_by_team below is the
+    uncached wrapper that turns a raised failure into the empty-list
+    fallback callers expect, on every call, not just the first."""
+    r = requests.get(
+        f"https://site.api.espn.com/apis/site/v2/sports/football/nfl/teams/{team_abbr}/roster",
+        timeout=10,
+    )
+    r.raise_for_status()
+    out = []
+    for group in r.json().get("athletes", []):
+        for p in group.get("items", []):
+            headshot_raw = p.get("headshot")
+            headshot_url = headshot_raw.get("href") if isinstance(headshot_raw, dict) else None
+            out.append({
+                "id": p.get("id"),
+                "name": p.get("fullName", ""),
+                "position": (p.get("position") or {}).get("abbreviation", ""),
+                "team": team_abbr,
+                "headshot_url": headshot_url,
+            })
+    return out
+
+
 def get_players_by_team(team_abbr: str) -> list[dict]:
     """Full roster for one team — used by Browse Team, and by espn_search_players above."""
     try:
-        r = requests.get(
-            f"https://site.api.espn.com/apis/site/v2/sports/football/nfl/teams/{team_abbr}/roster",
-            timeout=10,
-        )
-        if r.status_code != 200:
-            return []
-        out = []
-        for group in r.json().get("athletes", []):
-            for p in group.get("items", []):
-                headshot_raw = p.get("headshot")
-                headshot_url = headshot_raw.get("href") if isinstance(headshot_raw, dict) else None
-                out.append({
-                    "id": p.get("id"),
-                    "name": p.get("fullName", ""),
-                    "position": (p.get("position") or {}).get("abbreviation", ""),
-                    "team": team_abbr,
-                    "headshot_url": headshot_url,
-                })
-        return out
+        return _fetch_players_by_team(team_abbr)
     except Exception:
         return []
 
