@@ -77,25 +77,34 @@ def _mm_prop_bet_label(row) -> str:
     return f"{player} {side}{line_part} {market}".replace("  ", " ").strip()
 
 
-def render(supabase, now_utc, eff_bankroll, eff_kelly):
-    # ── This-week data — independent of the Fair Value Model's Date Range.
-    # NFL games cluster on Thu/Sun/Mon, so a literal "Today" window (the
-    # MLB pattern this was ported from) shows empty on most days. Use the
-    # current NFL week instead.
-    _current_week = infer_current_week_index(now_utc)
-    _week_label = "NFL Preseason" if _current_week == 0 else f"NFL Week {_current_week}"
-    _week_start, _week_end, _sport_keys, _week_caption = get_date_window(now_utc, _week_label)
+@st.cache_data(ttl=300, show_spinner=False)
+def _load_market_movers_data(_supabase, sport_keys: frozenset, week_start, week_end, bankroll: float, kelly: float):
+    """
+    Fetches and prices Game Markets + Player Props for the Market Movers
+    snapshot — a pure data function with zero Streamlit UI calls, safe to
+    cache. st.tabs() re-executes every tab's render() function on every
+    app-wide widget interaction (this one is unauthenticated and
+    unconditional, rendered before any other tab), so without this,
+    Market Movers redid a full 8-market devig/consensus/EV computation on
+    every unrelated click anywhere in the app — e.g. changing Team or
+    Position in Player Research. Cache key uses week_start/week_end
+    (already rounded to week boundaries by get_date_window) rather than
+    raw now_utc, which differs every microsecond and would never repeat
+    as a cache key. TTL matches the 300s TTL already used by the
+    underlying fetch_market_lines/fetch_prop_market_lines reads, so this
+    adds no staleness beyond what's already accepted there.
+    """
     _week_raw: dict[str, pd.DataFrame] = {}
     _week_display: dict[str, pd.DataFrame] = {}
     _week_pulled: list = []
 
     for _mkt_key, _mkt_cfg in MARKETS.items():
-        _raw_t, _pulled_t = fetch_market_lines(supabase, _sport_keys, _mkt_cfg.db_market_key)
-        _raw_t_filtered = filter_by_window(_raw_t, _week_start, _week_end)
+        _raw_t, _pulled_t = fetch_market_lines(_supabase, sport_keys, _mkt_cfg.db_market_key)
+        _raw_t_filtered = filter_by_window(_raw_t, week_start, week_end)
         _week_raw[_mkt_key] = _raw_t_filtered
         _week_pulled.extend(_pulled_t)
         _week_display[_mkt_key] = run_market_pipeline(
-            raw_lines=_raw_t_filtered, cfg=_mkt_cfg, bankroll=eff_bankroll, kelly=eff_kelly,
+            raw_lines=_raw_t_filtered, cfg=_mkt_cfg, bankroll=bankroll, kelly=kelly,
             min_ev=0.0, min_fair_pct=0.0, show_all=True,
         )
 
@@ -114,15 +123,15 @@ def render(supabase, now_utc, eff_bankroll, eff_kelly):
     # a second, independent EV calculation.
     df_props_week = pd.DataFrame()
     try:
-        _prop_event_ids = get_upcoming_prop_event_ids(supabase, _week_start.isoformat(), _week_end.isoformat())
+        _prop_event_ids = get_upcoming_prop_event_ids(_supabase, week_start.isoformat(), week_end.isoformat())
         _prop_frames = []
         for _pmkt_key, _pmkt_cfg in PROP_MARKETS.items():
             if not _prop_event_ids:
                 break
-            _praw = fetch_prop_market_lines(supabase, _prop_event_ids, _pmkt_key)
-            _praw_filtered = filter_by_window(_praw, _week_start, _week_end)
+            _praw = fetch_prop_market_lines(_supabase, _prop_event_ids, _pmkt_key)
+            _praw_filtered = filter_by_window(_praw, week_start, week_end)
             _pdf = run_prop_market_pipeline(
-                raw_lines=_praw_filtered, cfg=_pmkt_cfg, bankroll=eff_bankroll, kelly=eff_kelly,
+                raw_lines=_praw_filtered, cfg=_pmkt_cfg, bankroll=bankroll, kelly=kelly,
                 min_ev=0.0, min_fair_pct=0.0, show_all=True,
             )
             if not _pdf.empty:
@@ -131,6 +140,22 @@ def render(supabase, now_utc, eff_bankroll, eff_kelly):
             df_props_week = pd.concat(_prop_frames, ignore_index=True)
     except Exception:
         df_props_week = pd.DataFrame()
+
+    return _week_raw, df_week, df_props_week, _week_pulled
+
+
+def render(supabase, now_utc, eff_bankroll, eff_kelly):
+    # ── This-week data — independent of the Fair Value Model's Date Range.
+    # NFL games cluster on Thu/Sun/Mon, so a literal "Today" window (the
+    # MLB pattern this was ported from) shows empty on most days. Use the
+    # current NFL week instead.
+    _current_week = infer_current_week_index(now_utc)
+    _week_label = "NFL Preseason" if _current_week == 0 else f"NFL Week {_current_week}"
+    _week_start, _week_end, _sport_keys, _week_caption = get_date_window(now_utc, _week_label)
+
+    _week_raw, df_week, df_props_week, _week_pulled = _load_market_movers_data(
+        supabase, frozenset(_sport_keys), _week_start, _week_end, eff_bankroll, eff_kelly,
+    )
 
     with st.expander("Market Movers", expanded=True):
         st.caption(
