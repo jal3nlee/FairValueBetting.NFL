@@ -104,12 +104,18 @@ def _dispersion_label(row) -> str:
     return f"{float(std_dev) * 100:.1f}%"
 
 
-def _prop_fair_odds(row):
-    # PROP_MARKETS' side_a is always "over" (label_a="Over") — mi_fair_odds_a/
-    # mi_fair_odds_b are attached at the group level, not per side, so the
-    # matching one is selected the same way _recompute_row does for game
-    # markets above: by which side this specific row represents.
-    return row.get("mi_fair_odds_a") if row.get("Side") == "Over" else row.get("mi_fair_odds_b")
+def _prop_bet_label(row) -> str:
+    """One string identifying the exact prop bet, e.g.
+    'Justin Jefferson Over 79.5 Receiving Yards' — mirrors _bet_full_label's
+    role for Game Markets, adapted for props: player + side + line + prop
+    type in place of team + spread/total + opponent."""
+    player = row.get("Player", "—")
+    side = row.get("Side", "")
+    line = row.get("Line")
+    has_line = pd.notna(line) and str(line).strip()
+    market = row.get("Market", "")
+    line_part = f" {line}" if has_line else ""
+    return f"{player} {side}{line_part} {market}".replace("  ", " ").strip()
 
 
 def _render_player_props(supabase, now_utc, eff_bankroll, eff_kelly, debug_mode=False):
@@ -121,22 +127,41 @@ def _render_player_props(supabase, now_utc, eff_bankroll, eff_kelly, debug_mode=
     dedicated player_prop_snapshots/player_prop_lines tables — entirely
     separate storage and read path from Game Markets, so nothing here can
     affect that table's ingestion, pipeline call, or display above.
+
+    Filter/table structure deliberately mirrors the Game Markets branch of
+    render() below (same widget layout, same sportsbook-filter + recompute
+    pattern via mi_book_table, same Min EV%/Min Odds/No Min/Show All Bets
+    behavior) so switching views feels like switching market types within
+    one product, not two separate tools.
     """
-    _pr1, _pr2 = st.columns(2)
+    _format_options = ["American", "Decimal", "Implied %"]
+
+    # ── Row 1: Date Range · Prop · Odds Format ──────────────
+    _pr1, _pr2, _pr3 = st.columns(3)
     with _pr1:
+        from core.data_sources import infer_current_week_index
+        _wk = infer_current_week_index(now_utc)
+        _week_label = f"NFL Week {_wk}"
         _window_choice = st.selectbox(
-            "Date Range", ["Today", "This Week", "Next 7 Days"], index=1, key="fvm_prop_window_choice",
+            "Date Range", ["Today", _week_label, "Next 7 Days"], index=1, key="fvm_prop_window_choice",
         )
     window_start, window_end, _sport_keys, caption_label = get_date_window(now_utc, _window_choice)
 
+    with _pr3:
+        _odds_format = st.selectbox("Odds Format", _format_options, key="fvm_prop_odds_format")
+
+    # ── Load all approved prop markets ───────────────────────
+    all_raw_props: dict[str, pd.DataFrame] = {}
     all_prop_display = []
     with st.spinner("Loading NFL player props..."):
         event_ids = get_upcoming_prop_event_ids(supabase, window_start.isoformat(), window_end.isoformat())
         for mkt_key, mkt_cfg in PROP_MARKETS.items():
             if not event_ids:
+                all_raw_props[mkt_key] = pd.DataFrame()
                 continue
             raw = fetch_prop_market_lines(supabase, event_ids, mkt_key)
             raw_filtered = filter_by_window(raw, window_start, window_end)
+            all_raw_props[mkt_key] = raw_filtered
             df = run_prop_market_pipeline(
                 raw_lines=raw_filtered, cfg=mkt_cfg, bankroll=eff_bankroll, kelly=eff_kelly,
                 min_ev=0.0, min_fair_pct=0.0, show_all=True,
@@ -149,28 +174,172 @@ def _render_player_props(supabase, now_utc, eff_bankroll, eff_kelly, debug_mode=
     if debug_mode:
         st.caption(f"debug: player props — {len(event_ids)} event(s) in window, {len(df_props)} row(s) after pricing")
 
+    with _pr2:
+        _prop_opts = ["All"] + (sorted(df_props["Market"].dropna().unique().tolist()) if not df_props.empty else [])
+        _prop_sel = st.selectbox("Prop", _prop_opts, key="fvm_prop_mkt")
+
+    # ── Row 2: Minimum Expected Value · Minimum Odds ────────
+    _psr1, _psr2 = st.columns(2)
+    with _psr1:
+        _min_ev_sel = st.number_input(
+            "Minimum Expected Value (%)", min_value=0.0, max_value=10.0, value=0.0, step=0.5,
+            key="fvm_prop_min_ev",
+        )
+    with _psr2:
+        if _odds_format == "American":
+            _odds_fmt_key = "american"
+            _min_odds_kwargs = dict(min_value=-500, max_value=500, value=-110, step=5)
+        elif _odds_format == "Decimal":
+            _odds_fmt_key = "decimal"
+            _min_odds_kwargs = dict(min_value=0.0, max_value=10.0, value=1.91, step=0.05, format="%.2f")
+        else:
+            _odds_fmt_key = "implied"
+            _min_odds_kwargs = dict(min_value=0.0, max_value=100.0, value=52.4, step=0.1, format="%.1f")
+
+        _no_min_odds_key = f"fvm_prop_min_odds_no_min_{_odds_fmt_key}"
+        _min_odds_raw = st.number_input(
+            "Minimum Odds", key=f"fvm_prop_min_odds_val_{_odds_fmt_key}",
+            on_change=_uncheck_no_min_odds, args=(_no_min_odds_key,),
+            **_min_odds_kwargs,
+        )
+
+    # ── Sportsbook filter ────────────────────────────────────
+    _all_books_raw = sorted(set(
+        b for raw in all_raw_props.values() if not raw.empty for b in raw["book"].dropna().unique()
+    ))
+    _book_display_map = {b: _sc_name(b) for b in _all_books_raw}
+    _book_disp_to_keys: dict[str, set[str]] = {}
+    for _raw_book, _disp in _book_display_map.items():
+        _book_disp_to_keys.setdefault(_disp, set()).add(_raw_book.lower())
+
+    st.markdown("Sportsbooks")
+    _all_books_disp = sorted(_book_disp_to_keys.keys())
+    _selected_count = sum(1 for _b in _all_books_disp if st.session_state.get(f"fvm_prop_book_{_b}", True))
+    with st.popover(f"{_selected_count} of {len(_all_books_disp)} selected", use_container_width=True):
+        _psa, _psb = st.columns(2)
+        if _psa.button("Select all", use_container_width=True, key="fvm_prop_books_all"):
+            for _b in _all_books_disp:
+                st.session_state[f"fvm_prop_book_{_b}"] = True
+            st.rerun()
+        if _psb.button("Clear all", use_container_width=True, key="fvm_prop_books_none"):
+            for _b in _all_books_disp:
+                st.session_state[f"fvm_prop_book_{_b}"] = False
+            st.rerun()
+        st.divider()
+        _book_sel_disp = []
+        for _b in _all_books_disp:
+            _checked = st.checkbox(
+                _b, value=st.session_state.get(f"fvm_prop_book_{_b}", True), key=f"fvm_prop_book_{_b}",
+            )
+            if _checked:
+                _book_sel_disp.append(_b)
+    _book_sel_keys: set[str] = set()
+    for d in _book_sel_disp:
+        _book_sel_keys |= _book_disp_to_keys.get(d, set())
+
+    _pshow_col, _pno_min_col = st.columns(2)
+    with _pshow_col:
+        _show_all_bets = st.checkbox("Show all bets (include negative EV)", value=False, key="fvm_prop_show_all")
+    with _pno_min_col:
+        _no_min_odds = st.checkbox("No minimum", value=True, key=_no_min_odds_key)
+    _min_odds_sel = None if _no_min_odds else float(_min_odds_raw)
+    st.divider()
+
     if df_props.empty:
         st.info(f"No player prop data found for {caption_label}.")
         return
+    if not _book_sel_keys:
+        st.info("Select at least one sportsbook to see betting opportunities.")
+        return
 
-    with _pr2:
-        _prop_opts = ["All"] + sorted(df_props["Market"].dropna().unique().tolist())
-        _prop_sel = st.selectbox("Prop", _prop_opts, key="fvm_prop_mkt")
+    def _recompute_prop_row(row):
+        # Adapted from _recompute_row above for the Player Props shape:
+        # Side is always literally "Over"/"Under" (no team-name matching
+        # needed), and mi_book_table/_odds_a_raw/_odds_b_raw come from the
+        # same, unmodified build_market_intelligence used by Game Markets —
+        # only now exposed through core/nfl_prop_pipeline.py's own display
+        # builder rather than recalculated here.
+        book_table = row.get("mi_book_table")
+        if not isinstance(book_table, list) or not book_table:
+            return pd.Series({"_new_best_odds": None, "_new_best_book": None, "_new_ev_num": None, "_new_fair_odds": None})
+        pick_is_a = row.get("Side") == "Over"
+        fair_odds_val = row.get("mi_fair_odds_a") if pick_is_a else row.get("mi_fair_odds_b")
+        odds_key = "_odds_a_raw" if pick_is_a else "_odds_b_raw"
+        best_price, best_book_key = None, None
+        for b in book_table:
+            if b.get("_book_key") not in _book_sel_keys:
+                continue
+            p = b.get(odds_key)
+            if p is None:
+                continue
+            if best_price is None or p > best_price:
+                best_price = p
+                best_book_key = b.get("_book_key")
+        if best_price is None:
+            return pd.Series({"_new_best_odds": None, "_new_best_book": None, "_new_ev_num": None, "_new_fair_odds": None})
+        fw_raw = row.get("_fair_raw")
+        fair_raw = float(fw_raw) if pd.notna(fw_raw) else None
+        new_ev = expected_value_pct(fair_raw, best_price) if fair_raw is not None else None
+        return pd.Series({
+            "_new_best_odds": best_price,
+            "_new_best_book": _sc_name(best_book_key) if best_book_key else None,
+            "_new_ev_num": new_ev,
+            "_new_fair_odds": fair_odds_val,
+        })
 
     _pfilt = df_props.copy()
     if _prop_sel != "All":
         _pfilt = _pfilt[_pfilt["Market"] == _prop_sel]
-    _pfilt["Fair Odds"] = _pfilt.apply(lambda r: fmt_odds(_prop_fair_odds(r)), axis=1)
-    _pfilt["Consensus Confidence"] = _pfilt.get("mi_rating_label", "—")
-    _pfilt = _pfilt.sort_values("_ev_raw", ascending=False).reset_index(drop=True) if "_ev_raw" in _pfilt.columns \
-        else _pfilt.reset_index(drop=True)
+    _pfilt = pd.concat([_pfilt, _pfilt.apply(_recompute_prop_row, axis=1)], axis=1)
 
-    _prop_cols = ["Game", "Player", "Market", "Line", "Side", "Best Book", "Best Odds", "Fair Odds",
-                  "EV%", "Kelly (u)", "Consensus Confidence"]
-    _prop_display = _pfilt[[c for c in _prop_cols if c in _pfilt.columns]]
-    st.dataframe(_prop_display, use_container_width=True, hide_index=True,
-                 height=min(600, 38 + 35 * len(_prop_display)))
-    st.caption(f"{len(_prop_display)} result{'s' if len(_prop_display) != 1 else ''}")
+    if debug_mode:
+        st.caption(
+            f"debug: {len(_pfilt)} prop rows before book match, "
+            f"{_pfilt['_new_best_odds'].notna().sum()} have a matching book"
+        )
+    _pfilt = _pfilt.dropna(subset=["_new_best_odds"])
+    if not _show_all_bets:
+        _pfilt = _pfilt[_pfilt["_new_ev_num"] > 0]
+    if _min_ev_sel > 0:
+        _pfilt = _pfilt[_pfilt["_new_ev_num"] >= _min_ev_sel]
+    _pfilt["_odds_val_fmt"] = _pfilt["_new_best_odds"].apply(lambda v: _odds_value_in_format(v, _odds_format))
+    if _min_odds_sel is not None:
+        _pfilt = _pfilt[_pfilt["_odds_val_fmt"] >= _min_odds_sel]
+    _pfilt = _pfilt.sort_values("_new_ev_num", ascending=False).reset_index(drop=True)
+
+    if _pfilt.empty:
+        st.info("No betting opportunities match the current filters.")
+        return
+
+    _pfilt["Best Odds"] = _pfilt["_new_best_odds"].apply(lambda v: _fmt_best_odds(v, _odds_format))
+    _pfilt["Fair Odds"] = _pfilt["_new_fair_odds"].apply(lambda v: _fmt_best_odds(v, _odds_format))
+    _pfilt["EV%"] = _pfilt["_new_ev_num"].apply(fmt_ev)
+    _pfilt["Bet"] = _pfilt.apply(_prop_bet_label, axis=1)
+    _pfilt["Best Odds (Fair)"] = _pfilt["Best Odds"] + " (" + _pfilt["Fair Odds"] + ")"
+    _pfilt["Best Book"] = _pfilt["_new_best_book"]
+
+    with st.expander("FVM", expanded=True):
+        _prop_cols = ["Bet", "Best Odds (Fair)", "EV%", "Best Book"]
+        _prop_display = _pfilt[_prop_cols].reset_index(drop=True)
+        st.dataframe(
+            _prop_display, use_container_width=True, hide_index=True,
+            height=min(600, 38 + 35 * len(_prop_display)),
+            column_config={
+                "Bet":               st.column_config.TextColumn("Bet"),
+                "Best Odds (Fair)":  st.column_config.TextColumn(
+                    "Best Odds (Fair)",
+                    help=f"{TIPS['best_odds']} Fair Odds in parentheses — {TIPS['fair_odds']}",
+                ),
+                "EV%":               st.column_config.TextColumn("EV%", help=TIPS["ev"]),
+                "Best Book":         st.column_config.TextColumn(
+                    "Best Book", help="The sportsbook offering the Best Odds shown for this bet.",
+                ),
+            },
+        )
+        st.caption(
+            f"{len(_prop_display)} result{'s' if len(_prop_display) != 1 else ''} "
+            f"· {len(_book_sel_keys)} sportsbook{'s' if len(_book_sel_keys) != 1 else ''}"
+        )
 
 
 def render(supabase, now_utc, eff_bankroll, eff_kelly, authed, debug_mode=False):

@@ -131,7 +131,7 @@ def build_prop_display_rows(df_in: pd.DataFrame, cfg: MarketConfig, bankroll: fl
         "Market", "Date", "commence_time", "Game", "Player", "Side", "Pick", "Line",
         "Best Odds", "Best Book", "Fair Win %", "EV%", "Kelly (u)", "Stake ($)", "_ev_raw", "_fair_raw",
         "mi_rating", "mi_rating_label", "mi_num_books", "mi_num_anchors", "mi_anchor_list", "mi_std_dev",
-        "mi_fair_odds_a", "mi_fair_odds_b",
+        "mi_fair_odds_a", "mi_fair_odds_b", "mi_book_table",
     ]
     return result[[c for c in base_cols if c in result.columns]]
 
