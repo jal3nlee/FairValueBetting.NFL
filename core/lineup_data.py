@@ -248,9 +248,21 @@ def fetch_player_props_for_event(event_id: str, position: str) -> list[dict]:
 
 
 def get_consensus_prop_line(prop_rows: list[dict], player_name: str, market_key: str):
+    """
+    Median currently-posted line across books offering this player/market
+    (Over/Yes side only, since Over and Under share the same numeric line
+    for a two-sided prop) — a representative CURRENT MARKET line for
+    research purposes, not a devigged Fair Value calculation. Player
+    matching uses normalize_player_key (same normalization already used
+    by the Phase 1 player-prop pipeline) instead of raw string equality,
+    so formatting differences (punctuation, suffixes, case) between how a
+    sportsbook spells a name and how nflverse/ESPN spells it don't cause a
+    real player to go unmatched.
+    """
+    target = normalize_player_key(player_name)
     vals = [
         r["line"] for r in prop_rows
-        if r["player"].strip().lower() == player_name.strip().lower()
+        if normalize_player_key(r.get("player")) == target
         and r["market"] == market_key and r.get("side") in ("Over", "Yes") and r.get("line") is not None
     ]
     if not vals:

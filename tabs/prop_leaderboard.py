@@ -18,6 +18,27 @@ from core.nflverse_data import (
 from core.lineup_data import (
     get_team_game_context, fetch_player_props_for_event, get_consensus_prop_line,
 )
+from core.nfl_prop_market_config import normalize_player_key
+
+# Position-aware default Prop selection -- WR/TE default to Receiving
+# Yards even though PROP_POSITION_MAP's dict order would otherwise land
+# on "Rushing Yards" first for WR (both markets list WR as eligible, and
+# Rushing Yards appears first in that dict).
+_POSITION_DEFAULT_PROP = {
+    "QB": "Passing Yards", "RB": "Rushing Yards", "WR": "Receiving Yards", "TE": "Receiving Yards",
+}
+
+# Priority 3 fallback: used only when neither a current sportsbook line
+# nor a current-season game log average is available. These are static,
+# non-market, non-statistical starting points for research -- not a Fair
+# Value claim.
+_PROP_STATIC_FALLBACK = {
+    "Passing Yards": 225.5, "Passing TDs": 1.5, "Interceptions": 0.5,
+    "Pass Attempts": 32.5, "Completions": 20.5,
+    "Rushing Yards": 45.5, "Rushing Attempts": 10.5,
+    "Receiving Yards": 45.5, "Receptions": 3.5, "Targets": 5.5,
+    "Anytime TD": 0.5,
+}
 
 SPORTSBOOK_DISPLAY = {
     "fanduel": "FanDuel", "draftkings": "DraftKings", "betmgm": "BetMGM",
@@ -158,25 +179,82 @@ def _render_prop_analysis(player: dict, ctx: dict, supabase, now_utc):
         st.info("No supported prop stats for this position.")
         return
 
+    _default_prop = _POSITION_DEFAULT_PROP.get(player["position"])
+    _default_prop_index = _available.index(_default_prop) if _default_prop in _available else 0
+
     _r1c1, _r1c2, _r1c3 = st.columns([1.6, 1.0, 1.4], gap="small")
     with _r1c1:
         st.caption("Prop")
-        _picked_label = st.selectbox("Prop", _available, key="ps_stat_pick", label_visibility="collapsed")
+        _picked_label = st.selectbox(
+            "Prop", _available, index=_default_prop_index, key="ps_stat_pick", label_visibility="collapsed",
+        )
     stat_field = PROP_STAT_MAP.get(_picked_label) or PLAYER_SEARCH_EXTRA_STATS.get(_picked_label)
 
+    # Current sportsbook market data for this player/prop -- a single
+    # live per-event Odds API call (cached 30 min), already the same path
+    # Lineup Analysis uses via fetch_player_props_for_event/
+    # get_consensus_prop_line. Not routed through the Phase 1 Supabase
+    # player_prop_snapshots/player_prop_lines pipeline or its
+    # devig/consensus/EV/Kelly engine -- this is a lightweight research
+    # default, not a Fair Value calculation, and doesn't need that
+    # heavier machinery just to populate a starting threshold.
     odds_market_key = PROP_LABEL_TO_ODDS_MARKET.get(_picked_label)
     prop_rows = []
-    consensus_line = None
+    market_line = None
+    _book_lines = []
     if odds_market_key and ctx.get("event_id"):
         prop_rows = fetch_player_props_for_event(ctx["event_id"], player["position"])
-        consensus_line = get_consensus_prop_line(prop_rows, player["name"], odds_market_key)
+        market_line = get_consensus_prop_line(prop_rows, player["name"], odds_market_key)
+        _target_key = normalize_player_key(player["name"])
+        _book_lines = sorted({
+            float(r["line"]) for r in prop_rows
+            if normalize_player_key(r.get("player")) == _target_key
+            and r.get("market") == odds_market_key and r.get("line") is not None
+        })
+
+    # Priority 2 fallback: current-season per-game average for this exact
+    # stat, from the same game log the Prop Hit Rate section below
+    # already needs -- computed once here and reused there, not fetched
+    # twice.
+    _full_log = get_player_game_log(player["name"], player["team"], stat_field, n_games=None)
+    _season_avg = None
+    if _full_log:
+        _vals = [g["value"] for g in _full_log if g.get("value") is not None]
+        if _vals:
+            _season_avg = round(sum(_vals) / len(_vals) * 2) / 2
+
+    if market_line is not None:
+        _default_line, _line_source = float(market_line), "market"
+    elif _season_avg is not None:
+        _default_line, _line_source = _season_avg, "season"
+    else:
+        _default_line, _line_source = _PROP_STATIC_FALLBACK.get(_picked_label, 0.5), "fallback"
+
+    # Reinitialize the research threshold only when Player or Prop
+    # actually changes (a fresh widget key), not on every unrelated
+    # rerun (Sample Size/Side changes reuse the same key and Streamlit
+    # preserves whatever the user has typed) -- and surface currently
+    # posted lines as one-click choices when more than one is available,
+    # without letting that quick-pick keep overwriting a manual edit on
+    # later reruns.
+    _threshold_key = f"ps_threshold__{player['name']}__{_picked_label}"
+    if len(_book_lines) > 1:
+        _quick_pick_key = f"ps_quickline__{player['name']}__{_picked_label}"
+        _quick_applied_key = f"{_quick_pick_key}__applied"
+        st.caption("Market Lines")
+        _quick_pick = st.segmented_control(
+            "Market Lines", [f"{l:g}" for l in _book_lines],
+            key=_quick_pick_key, label_visibility="collapsed",
+        )
+        if _quick_pick is not None and st.session_state.get(_quick_applied_key) != _quick_pick:
+            st.session_state[_threshold_key] = float(_quick_pick)
+            st.session_state[_quick_applied_key] = _quick_pick
 
     with _r1c2:
         st.caption("Prop Line")
         _threshold = st.number_input(
-            "Prop Line", min_value=0.0,
-            value=float(consensus_line) if consensus_line is not None else 0.5,
-            step=0.5, key="ps_threshold", label_visibility="collapsed",
+            "Prop Line", min_value=0.0, value=_default_line,
+            step=0.5, key=_threshold_key, label_visibility="collapsed",
         )
     with _r1c3:
         st.caption("Sample Size")
@@ -195,13 +273,15 @@ def _render_prop_analysis(player: dict, ctx: dict, supabase, now_utc):
     st.markdown("<div style='font-size:1.05rem;font-weight:700;margin:0 0 2px 0'>Current Market</div>", unsafe_allow_html=True)
     if not odds_market_key:
         st.caption(f"{_picked_label} isn't tracked by sportsbooks — research the line above manually.")
-    elif consensus_line is None:
-        st.caption("Player props are not available yet. Check back closer to kickoff.")
+    elif market_line is None:
+        if _line_source == "season":
+            st.caption(f"No current sportsbook market yet — line defaulted to this season's average ({_season_avg:g}).")
+        else:
+            st.caption("Player props are not available yet. Check back closer to kickoff.")
     else:
-        st.markdown(f"**{_picked_label} — {consensus_line:g}** (consensus)")
         _book_rows = {}
         for r in prop_rows:
-            if r["player"].strip().lower() != player["name"].strip().lower() or r["market"] != odds_market_key:
+            if normalize_player_key(r.get("player")) != normalize_player_key(player["name"]) or r["market"] != odds_market_key:
                 continue
             b = r["book"]
             _book_rows.setdefault(b, {"Sportsbook": _sc_name(b), "Line": r.get("line"), "Over": None, "Under": None})
@@ -209,6 +289,11 @@ def _render_prop_analysis(player: dict, ctx: dict, supabase, now_utc):
                 _book_rows[b]["Over"] = _fmt_odds(r.get("price"))
             elif r.get("side") in ("Under", "No"):
                 _book_rows[b]["Under"] = _fmt_odds(r.get("price"))
+        _n_books = len(_book_rows)
+        st.markdown(
+            f"**Current Market Line: {market_line:g}** "
+            f"({_n_books} book{'s' if _n_books != 1 else ''} currently posted)"
+        )
         if _book_rows:
             st.dataframe(pd.DataFrame(list(_book_rows.values())), use_container_width=True, hide_index=True)
         else:
@@ -220,7 +305,6 @@ def _render_prop_analysis(player: dict, ctx: dict, supabase, now_utc):
     st.caption("See how often this player has cleared the selected prop line.")
 
     _sample_n = {"Last 5 Games": 5, "Last 10 Games": 10, "Season": None}[_sample_label]
-    _full_log = get_player_game_log(player["name"], player["team"], stat_field, n_games=None)
     _dashboard_log = _full_log[:_sample_n] if _sample_n else _full_log
 
     render_prop_hit_rate_dashboard(
