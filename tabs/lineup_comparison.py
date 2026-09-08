@@ -199,17 +199,13 @@ def render(supabase, now_utc):
 
     st.markdown("<div style='margin-top:6px'></div>", unsafe_allow_html=True)
 
-    def _row(label, values, higher_is_better=True):
-        _real = [v for v in values if v is not None and not (isinstance(v, float) and pd.isna(v))]
-        best = max(_real) if higher_is_better and _real else (min(_real) if _real else None)
-        cells = []
-        for v in values:
-            disp = _dash(v)
-            if v is not None and best is not None and v == best and len(_real) > 1:
-                cells.append(f"**{disp}**")
-            else:
-                cells.append(str(disp))
-        return [label] + cells
+    def _row(label, values):
+        return [label] + [str(_dash(v)) for v in values]
+
+    def _fmt_spread(v):
+        if v is None or (isinstance(v, float) and pd.isna(v)):
+            return "—"
+        return f"{v:+g}"
 
     _names = [p["name"] for p in enriched]
 
@@ -239,20 +235,18 @@ def render(supabase, now_utc):
             ctx = enriched[0]["context"]
             _env = {
                 "Opponent": ctx.get("opponent", "—"), "Home/Away": "Home" if ctx.get("is_home") else "Away",
-                "Spread": ctx.get("spread", "—"), "Game Total": ctx.get("game_total", "—"),
+                "Spread": _fmt_spread(ctx.get("spread")), "Game Total": ctx.get("game_total", "—"),
                 "Team Implied Total": ctx.get("team_implied_total", "—"),
             }
             st.dataframe(pd.DataFrame([_env]), use_container_width=True, hide_index=True)
         else:
             _env_metrics = [
-                ("Opponent", [p["context"].get("opponent") for p in enriched], None),
-                ("Spread", [p["context"].get("spread") for p in enriched], False),
-                ("Game Total", [p["context"].get("game_total") for p in enriched], True),
-                ("Team Implied Total", [p["context"].get("team_implied_total") for p in enriched], True),
+                ("Opponent", [p["context"].get("opponent") for p in enriched]),
+                ("Spread", [_fmt_spread(p["context"].get("spread")) for p in enriched]),
+                ("Game Total", [p["context"].get("game_total") for p in enriched]),
+                ("Team Implied Total", [p["context"].get("team_implied_total") for p in enriched]),
             ]
-            _rows = []
-            for label, vals, higher in _env_metrics:
-                _rows.append(_row(label, vals, higher_is_better=higher) if higher is not None else [label] + [str(_dash(v)) for v in vals])
+            _rows = [_row(label, vals) for label, vals in _env_metrics]
             st.dataframe(pd.DataFrame(_rows, columns=["Metric"] + _names), use_container_width=True, hide_index=True)
         st.markdown("<div style='margin-top:14px'></div>", unsafe_allow_html=True)
 

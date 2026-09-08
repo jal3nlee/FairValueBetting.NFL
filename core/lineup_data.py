@@ -10,17 +10,24 @@ ODDS_API_KEY = os.getenv("ODDS_API_KEY", "")
 ODDS_API_SPORT_KEY = "americanfootball_nfl"
 
 POSITION_PROP_MARKETS = {
+    # player_anytime_td deliberately excluded: The Odds API returns it as a
+    # Yes/No proposition with no numeric "point" value, but
+    # get_consensus_prop_line only extracts rows with a non-null "line" --
+    # so requesting it can never actually produce a displayable value here
+    # (it would always resolve to no line found). Removed rather than kept
+    # around unused, per the Anytime TD audit: no reliable current source
+    # feeds a real line for this row.
     "QB": [
         "player_pass_yds", "player_pass_tds", "player_pass_interceptions",
         "player_pass_attempts", "player_pass_completions",
-        "player_rush_yds", "player_anytime_td",
+        "player_rush_yds",
     ],
     "RB": [
         "player_rush_yds", "player_rush_attempts",
-        "player_reception_yds", "player_receptions", "player_anytime_td",
+        "player_reception_yds", "player_receptions",
     ],
-    "WR": ["player_reception_yds", "player_receptions", "player_anytime_td"],
-    "TE": ["player_reception_yds", "player_receptions", "player_anytime_td"],
+    "WR": ["player_reception_yds", "player_receptions"],
+    "TE": ["player_reception_yds", "player_receptions"],
 }
 
 PROP_LABELS = {
@@ -33,7 +40,6 @@ PROP_LABELS = {
     "player_rush_attempts": "Rush Attempts",
     "player_reception_yds": "Receiving Yards",
     "player_receptions": "Receptions",
-    "player_anytime_td": "Anytime TD",
 }
 
 NFL_TEAMS = {
@@ -159,7 +165,18 @@ def get_team_game_context(supabase, team_name: str, now_utc) -> dict:
     raw, _ = fetch_market_lines(supabase, sport_keys, "spread")
     if raw.empty:
         return {}
-    games = raw[raw["home_team"].eq(team_name) | raw["away_team"].eq(team_name)]
+    # "side" must be pinned to "home" here: odds_lines carries one row per
+    # book per side, and each side's own "line" is already that side's own
+    # signed spread (fetch_odds_nfl.py stores outcome.get("point") as-is
+    # per side, not a single home-normalized value copied to both rows).
+    # Without this filter, .iloc[0] below picks an arbitrary book/side row
+    # for this game -- home or away, whichever happened to sort first --
+    # and the unconditional negation two lines down (which assumes g["line"]
+    # is always the HOME side's spread) would then be wrong exactly when
+    # that arbitrary pick was actually the away row.
+    games = raw[
+        (raw["home_team"].eq(team_name) | raw["away_team"].eq(team_name)) & raw["side"].eq("home")
+    ]
     if games.empty:
         return {}
     g = games.sort_values("commence_time").iloc[0]
