@@ -5,29 +5,33 @@ import streamlit as st
 import pandas as pd
 
 from core.data_sources import fetch_market_lines, get_date_window
+from core.pipeline import _consensus_engine
+from core.nfl_prop_market_config import normalize_player_key, MIN_BOOKS_FOR_PROP_CONSENSUS
 
 ODDS_API_KEY = os.getenv("ODDS_API_KEY", "")
 ODDS_API_SPORT_KEY = "americanfootball_nfl"
 
 POSITION_PROP_MARKETS = {
-    # player_anytime_td deliberately excluded: The Odds API returns it as a
-    # Yes/No proposition with no numeric "point" value, but
-    # get_consensus_prop_line only extracts rows with a non-null "line" --
-    # so requesting it can never actually produce a displayable value here
-    # (it would always resolve to no line found). Removed rather than kept
-    # around unused, per the Anytime TD audit: no reliable current source
-    # feeds a real line for this row.
+    # player_anytime_td restored: it's a genuine Yes/No two-outcome market
+    # (Odds API market catalog: "Anytime Touchdown Scorer (Yes/No)"), not a
+    # numeric-line prop. Previously removed because the old parsing path
+    # (get_consensus_prop_line, expects a non-null "line") could never
+    # extract a value from it. Now consumed only by
+    # get_market_implied_td_fair_probability below, which reuses
+    # core/pipeline.py's own devig/consensus engine for this exact
+    # two-sided shape (identical to how MARKETS["moneyline"] is handled) --
+    # never routed through get_consensus_prop_line's numeric-line parser.
     "QB": [
         "player_pass_yds", "player_pass_tds", "player_pass_interceptions",
         "player_pass_attempts", "player_pass_completions",
-        "player_rush_yds",
+        "player_rush_yds", "player_anytime_td",
     ],
     "RB": [
         "player_rush_yds", "player_rush_attempts",
-        "player_reception_yds", "player_receptions",
+        "player_reception_yds", "player_receptions", "player_anytime_td",
     ],
-    "WR": ["player_reception_yds", "player_receptions"],
-    "TE": ["player_reception_yds", "player_receptions"],
+    "WR": ["player_reception_yds", "player_receptions", "player_anytime_td"],
+    "TE": ["player_reception_yds", "player_receptions", "player_anytime_td"],
 }
 
 PROP_LABELS = {
@@ -260,16 +264,178 @@ def get_relevant_props_for_position(position: str) -> list[str]:
     return POSITION_PROP_MARKETS.get(position, [])
 
 
-def build_player_comparison(supabase, players: list[dict], now_utc) -> list[dict]:
+def get_market_implied_td_fair_probability(prop_rows: list[dict], player_name: str) -> float | None:
+    """
+    Fair (devigged, sportsbook-weighted) probability this player scores
+    an anytime touchdown, from The Odds API's player_anytime_td market --
+    a genuine two-sided Yes/No market (Odds API market catalog:
+    "Anytime Touchdown Scorer (Yes/No)"), structurally identical to
+    Moneyline (core/pipeline.py's MARKETS["moneyline"]: two-sided, no
+    numeric line). Reuses _consensus_engine (core/pipeline.py, unmodified
+    -- imported directly the same way core/nfl_prop_pipeline.py already
+    does) for the exact same per-book devig + BOOK_WEIGHTS-weighted
+    consensus used everywhere else in this app. No new devig method.
+
+    Only books that post BOTH a Yes and a No price for this player
+    contribute -- a book offering only a one-sided "Yes" price is dropped
+    entirely by _consensus_engine's own dropna on both implied
+    probabilities, the same behavior every other two-sided market in
+    this app already relies on. A one-sided price is never treated as a
+    real fair probability. Returns None if fewer than
+    MIN_BOOKS_FOR_PROP_CONSENSUS books clear that bar for this player,
+    matching the same coverage gate already used for the Phase 1
+    player-prop pipeline rather than inventing a new threshold.
+    """
+    target = normalize_player_key(player_name)
+    if target is None:
+        return None
+    rows = []
+    for r in prop_rows:
+        if r.get("market") != "player_anytime_td":
+            continue
+        if normalize_player_key(r.get("player")) != target:
+            continue
+        side = str(r.get("side") or "").strip().lower()
+        if side not in ("yes", "no"):
+            continue
+        price = r.get("price")
+        if price is None:
+            continue
+        rows.append({"book": r.get("book"), "side": side, "price": price})
+    if not rows:
+        return None
+
+    df = pd.DataFrame(rows)
+    df["yes_price"] = df.apply(lambda r: r["price"] if r["side"] == "yes" else None, axis=1)
+    df["no_price"] = df.apply(lambda r: r["price"] if r["side"] == "no" else None, axis=1)
+    books_df = df.groupby("book", as_index=False).agg(
+        yes_price=("yes_price", "max"), no_price=("no_price", "max"),
+    )
+    books_df["_grp"] = 1
+    cons = _consensus_engine(
+        books_df, group_keys=["_grp"], side_a_price="yes_price", side_b_price="no_price",
+        out_a="yes_fair_prob", out_b="no_fair_prob", label="Anytime TD",
+    )
+    if cons.empty:
+        return None
+    row = cons.iloc[0]
+    if int(row["num_books"]) < MIN_BOOKS_FOR_PROP_CONSENSUS:
+        return None
+    return float(row["yes_fair_prob"])
+
+
+_REC_PTS_BY_SCORING = {"PPR": 1.0, "Half PPR": 0.5, "Standard": 0.0}
+
+# Standard fantasy-scoring weights per stat -- matching the same
+# convention nflreadpy's own fantasy_points/fantasy_points_ppr fields use
+# (4pt passing TDs, 0.04 pt/passing yard, 0.1 pt/rush-or-receiving yard,
+# 6pt rush/receiving TD, -2pt interception; core/nfl_defense_data.py::
+# _fantasy_points_for reads those precomputed nflreadpy totals directly
+# for historical stats). This repo has no existing named constant for the
+# per-stat weights themselves, only the precomputed totals, so these are
+# newly defined here -- intentionally matching that same convention
+# rather than inventing different weights. No 4pt-vs-6pt passing-TD
+# league toggle exists anywhere in this app (Scoring is PPR/Half PPR/
+# Standard only), so this follows nflreadpy's own standard-scoring
+# convention (4pt) rather than assuming a 6pt variant.
+_PTS_PER_PASS_YARD = 0.04
+_PTS_PER_PASS_TD = 4.0
+_PTS_PER_INTERCEPTION = -2.0
+_PTS_PER_RUSH_YARD = 0.1
+_PTS_PER_REC_YARD = 0.1
+_PTS_PER_TD = 6.0  # rushing/receiving TD, and the market-implied "any TD" proxy
+
+
+def calculate_market_implied_fantasy_points(
+    props: dict, position: str, scoring: str, td_fair_prob: float | None,
+) -> float | None:
+    """
+    V1 market-implied fantasy-points estimate: converts the existing
+    weighted-consensus prop lines (props, from get_consensus_prop_line --
+    the same devigged consensus already used for the Player Props table,
+    not recalculated differently here) plus Market-Implied TD Fair
+    Probability into a fantasy-scoring estimate via the standard weights
+    above. This is a V1 point estimate, not a statistically exact
+    expectation -- a sportsbook Over/Under line is not guaranteed to
+    equal the true distribution mean.
+
+    Returns None ("Insufficient market data") rather than treating a
+    missing REQUIRED component as zero. Per position, minimum required:
+      QB: passing yards AND passing TDs
+      RB: rushing yards
+      WR/TE: receiving yards AND receptions
+    Interceptions/rushing yards (QB) and touchdown probability (all
+    positions) are additive-only -- they simply don't contribute if
+    unavailable, since they're explicitly optional rather than a hard
+    requirement (matching how the actual market coverage varies by
+    player/book).
+    """
+    rec_pts = _REC_PTS_BY_SCORING.get(scoring, 0.0)
+    td_component = (td_fair_prob * _PTS_PER_TD) if td_fair_prob is not None else 0.0
+
+    if position == "QB":
+        pass_yds = props.get("player_pass_yds")
+        pass_tds = props.get("player_pass_tds")
+        if pass_yds is None or pass_tds is None:
+            return None
+        total = pass_yds * _PTS_PER_PASS_YARD + pass_tds * _PTS_PER_PASS_TD
+        ints = props.get("player_pass_interceptions")
+        if ints is not None:
+            total += ints * _PTS_PER_INTERCEPTION
+        rush_yds = props.get("player_rush_yds")
+        if rush_yds is not None:
+            total += rush_yds * _PTS_PER_RUSH_YARD
+        total += td_component
+        return round(total, 1)
+
+    if position == "RB":
+        rush_yds = props.get("player_rush_yds")
+        if rush_yds is None:
+            return None
+        total = rush_yds * _PTS_PER_RUSH_YARD
+        rec_yds = props.get("player_reception_yds")
+        if rec_yds is not None:
+            total += rec_yds * _PTS_PER_REC_YARD
+        recs = props.get("player_receptions")
+        if recs is not None:
+            total += recs * rec_pts
+        total += td_component
+        return round(total, 1)
+
+    if position in ("WR", "TE"):
+        rec_yds = props.get("player_reception_yds")
+        recs = props.get("player_receptions")
+        if rec_yds is None or recs is None:
+            return None
+        total = rec_yds * _PTS_PER_REC_YARD + recs * rec_pts
+        total += td_component
+        return round(total, 1)
+
+    return None
+
+
+def build_player_comparison(supabase, players: list[dict], now_utc, scoring: str = "PPR") -> list[dict]:
     enriched = []
     for p in players:
         ctx = get_team_game_context(supabase, p["team"], now_utc) if p.get("team") else {}
         props = {}
+        td_fair_prob = None
         if ctx.get("event_id"):
             raw_props = fetch_player_props_for_event(ctx["event_id"], p["position"])
             for market_key in get_relevant_props_for_position(p["position"]):
+                if market_key == "player_anytime_td":
+                    # Yes/No market -- handled via
+                    # get_market_implied_td_fair_probability below, never
+                    # routed through get_consensus_prop_line's numeric-line
+                    # parser (which would only ever find no line for it).
+                    continue
                 props[market_key] = get_consensus_prop_line(raw_props, p["name"], market_key)
-        enriched.append({**p, "context": ctx, "props": props})
+            td_fair_prob = get_market_implied_td_fair_probability(raw_props, p["name"])
+        market_implied_fp = calculate_market_implied_fantasy_points(props, p["position"], scoring, td_fair_prob)
+        enriched.append({
+            **p, "context": ctx, "props": props,
+            "td_fair_prob": td_fair_prob, "market_implied_fantasy_points": market_implied_fp,
+        })
     return enriched
 
 

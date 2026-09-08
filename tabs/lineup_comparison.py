@@ -76,12 +76,32 @@ def _fmt_val(v, is_pct):
     return f"{v * 100:.0f}%" if is_pct else f"{v:.1f}"
 
 
-def render_usage_role(enriched: list[dict], names: list[str]):
+def render_usage_role(enriched: list[dict], names: list[str], allow_mixed_positions: bool = False):
+    """
+    allow_mixed_positions=True (FLEX slot): shows the union of each
+    compared player's own LINEUP_USAGE_METRICS, rather than requiring a
+    single shared position. A metric that doesn't apply to a given
+    player's own position shows "—" for that player (the existing
+    missing-value convention) instead of being fabricated or suppressing
+    the whole section.
+    """
     _section_heading("Usage & Role")
     positions = {p["position"] for p in enriched}
-    metrics = LINEUP_USAGE_METRICS.get(next(iter(positions)), []) if len(positions) == 1 else []
+    mixed = len(positions) > 1 and allow_mixed_positions
+    if len(positions) == 1:
+        metrics = LINEUP_USAGE_METRICS.get(next(iter(positions)), [])
+    elif mixed:
+        metrics = []
+        _seen = set()
+        for p in enriched:
+            for m in LINEUP_USAGE_METRICS.get(p["position"], []):
+                if m not in _seen:
+                    _seen.add(m)
+                    metrics.append(m)
+    else:
+        metrics = []
     if not metrics:
-        if len(positions) > 1:
+        if len(positions) > 1 and not allow_mixed_positions:
             st.caption("Select players at the same position to see matched usage metrics.")
         else:
             st.caption("Usage data temporarily unavailable.")
@@ -115,6 +135,9 @@ def render_usage_role(enriched: list[dict], names: list[str]):
             for wkey, wlabel in [("season", "Season"), ("last5", "Last 5"), ("last3", "Last 3")]:
                 row = [f"{label} — {wlabel}"]
                 for p in enriched:
+                    if mixed and m not in LINEUP_USAGE_METRICS.get(p["position"], []):
+                        row.append("—")  # metric doesn't apply to this player's own position
+                        continue
                     w = usage_by_player.get(p["name"], {}).get(m, {}).get(wkey, {})
                     row.append(_fmt_val(w.get("value"), is_pct))
                 _rows.append(row)
@@ -195,9 +218,11 @@ def render(supabase, now_utc):
         return
 
     with st.spinner("Loading market data..."):
-        enriched = build_player_comparison(supabase, _confirmed_players, now_utc)
+        enriched = build_player_comparison(supabase, _confirmed_players, now_utc, scoring=_scoring)
 
     st.markdown("<div style='margin-top:6px'></div>", unsafe_allow_html=True)
+
+    _is_flex = _mode == "FLEX"
 
     def _row(label, values):
         return [label] + [str(_dash(v)) for v in values]
@@ -207,23 +232,50 @@ def render(supabase, now_utc):
             return "—"
         return f"{v:+g}"
 
+    def _fmt_pct(v):
+        return "—" if v is None else f"{v * 100:.0f}%"
+
+    def _fmt_fp(v):
+        return "—" if v is None else f"{v:.1f}"
+
     _names = [p["name"] for p in enriched]
 
     _all_markets = sorted(set(m for p in enriched for m in p["props"].keys()))
-    _has_any_prop_value = any(p["props"].get(m) is not None for p in enriched for m in _all_markets)
+    _has_any_prop_value = (
+        any(p["props"].get(m) is not None for p in enriched for m in _all_markets)
+        or any(p.get("td_fair_prob") is not None for p in enriched)
+        or any(p.get("market_implied_fantasy_points") is not None for p in enriched)
+    )
     _section_heading("Player Props")
-    if not _all_markets or not _has_any_prop_value:
+    if not _all_markets and not _has_any_prop_value:
         st.caption("Player props are not available yet. Check back closer to kickoff.")
     else:
+        # Market-Implied Fantasy Points and TD Fair Probability lead the
+        # table (most decision-relevant), followed by the individual
+        # sportsbook prop lines they're derived from.
         if len(enriched) == 1:
-            _rows = [{"Prop": PROP_LABELS.get(m, m), "Line": enriched[0]["props"].get(m, "—")} for m in _all_markets]
+            p0 = enriched[0]
+            _rows = [
+                {"Prop": "Market-Implied Fantasy Points", "Line": _fmt_fp(p0.get("market_implied_fantasy_points"))},
+                {"Prop": "Market-Implied TD Fair Probability", "Line": _fmt_pct(p0.get("td_fair_prob"))},
+            ]
+            _rows += [{"Prop": PROP_LABELS.get(m, m), "Line": p0["props"].get(m, "—")} for m in _all_markets]
             st.dataframe(pd.DataFrame(_rows), use_container_width=True, hide_index=True)
         else:
-            _rows = [_row(PROP_LABELS.get(m, m), [p["props"].get(m) for p in enriched]) for m in _all_markets]
+            _rows = [
+                _row("Market-Implied Fantasy Points", [_fmt_fp(p.get("market_implied_fantasy_points")) for p in enriched]),
+                _row("Market-Implied TD Fair Probability", [_fmt_pct(p.get("td_fair_prob")) for p in enriched]),
+            ]
+            _rows += [_row(PROP_LABELS.get(m, m), [p["props"].get(m) for p in enriched]) for m in _all_markets]
             st.dataframe(pd.DataFrame(_rows, columns=["Metric"] + _names), use_container_width=True, hide_index=True)
+        st.caption(
+            "Market-Implied Fantasy Points is a V1 estimate derived from current sportsbook prop lines and "
+            "devigged touchdown probability, translated through standard fantasy scoring — not a statistical "
+            "projection."
+        )
 
     st.markdown("<div style='margin-top:14px'></div>", unsafe_allow_html=True)
-    render_usage_role(enriched, _names)
+    render_usage_role(enriched, _names, allow_mixed_positions=_is_flex)
     st.markdown("<div style='margin-top:14px'></div>", unsafe_allow_html=True)
     render_recent_games(enriched)
     st.markdown("<div style='margin-top:14px'></div>", unsafe_allow_html=True)
@@ -268,5 +320,5 @@ def render(supabase, now_utc):
         )
         render_opponent_defense_multi(
             [{"name": p["name"], "position": p["position"], "opponent": p["context"].get("opponent")} for p in enriched],
-            _scoring,
+            _scoring, allow_mixed_positions=_is_flex,
         )

@@ -44,29 +44,46 @@ def render_opponent_defense_single(opponent: str | None, position: str, scoring:
     st.caption("Defensive data: nflverse")
 
 
-def render_opponent_defense_multi(players_with_opponents: list[dict], scoring: str = "PPR"):
+def render_opponent_defense_multi(players_with_opponents: list[dict], scoring: str = "PPR", allow_mixed_positions: bool = False):
     """
     players_with_opponents: [{"name", "position", "opponent"}, ...] — used
     for Lineup Analysis's multi-player comparison. Same general opponent
     defensive stats as above, matched to each selected player's position.
     Column headers are just each opponent's team name.
+
+    allow_mixed_positions=True (FLEX slot): each player is evaluated
+    against their OWN position's defensive metrics, never forced onto a
+    shared positional metric set. The displayed rows are the union of
+    each compared player's own POSITION_DEFENSE_METRICS entries (e.g. a
+    RB vs WR comparison shows "RB Fantasy Pts Allowed / G" and "WR
+    Fantasy Pts Allowed / G" as separate rows, each populated only for
+    the player whose position it belongs to — never merged into one
+    shared row, never fabricated for the other player).
     """
     if all(not p.get("opponent") for p in players_with_opponents):
         st.caption("No opponent this week (bye week).")
         return
 
     positions = {p["position"] for p in players_with_opponents}
-    if len(positions) != 1:
+    if len(positions) != 1 and not allow_mixed_positions:
         st.caption("Select players at the same position to see matched defensive context.")
         return
-    position = next(iter(positions))
-    metric_set = POSITION_DEFENSE_METRICS.get(position, [])
+
+    # Union of each player's own position-specific metric rows, in the
+    # order each position first contributes them.
+    metric_set = []
+    _seen_fields = set()
+    for p in players_with_opponents:
+        for field, label in POSITION_DEFENSE_METRICS.get(p["position"], []):
+            if field not in _seen_fields:
+                _seen_fields.add(field)
+                metric_set.append((field, label))
     if not metric_set:
         st.caption("Opponent defensive data is not available yet.")
         return
 
     def_by_player = {
-        p["name"]: get_opponent_defense(p.get("opponent"), position, scoring) for p in players_with_opponents
+        p["name"]: get_opponent_defense(p.get("opponent"), p["position"], scoring) for p in players_with_opponents
     }
     headers = [p.get("opponent") or "Bye Week" for p in players_with_opponents]
 
@@ -74,6 +91,10 @@ def render_opponent_defense_multi(players_with_opponents: list[dict], scoring: s
     for field, label in metric_set:
         row = [label]
         for p in players_with_opponents:
+            own_fields = {f for f, _ in POSITION_DEFENSE_METRICS.get(p["position"], [])}
+            if field not in own_fields:
+                row.append("—")  # metric belongs to a different position -- not fabricated for this player
+                continue
             d = def_by_player.get(p["name"])
             v = d.get(field) if d else None
             row.append(v if v is not None else "—")
