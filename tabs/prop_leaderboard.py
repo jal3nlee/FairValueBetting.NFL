@@ -172,6 +172,17 @@ def render_leaderboard_view(supabase, now_utc):
 
 
 def _render_prop_analysis(player: dict, ctx: dict, supabase, now_utc):
+    """
+    Prop stays reactive (outside st.form) because it determines both the
+    position-specific option set and which current-market line/quick-picks
+    apply -- a form defers ALL its widgets' effects until submit, so a
+    Prop selector inside one couldn't visibly refresh the market-line
+    preview on selection. Everything below it that has no cross-control
+    dependency (Prop Line, Sample Size, Side) lives inside a form; only
+    pressing "Run Analysis" triggers the Prop Hit Rate / Recent Prop
+    Results section, using the exact values submitted at that moment --
+    not whatever the widgets currently show if they've since changed.
+    """
     _available = [s for s, positions in PROP_POSITION_MAP.items() if player["position"] in positions]
     if player["position"] in ("WR", "TE", "RB"):
         _available = _available + list(PLAYER_SEARCH_EXTRA_STATS.keys())
@@ -182,12 +193,10 @@ def _render_prop_analysis(player: dict, ctx: dict, supabase, now_utc):
     _default_prop = _POSITION_DEFAULT_PROP.get(player["position"])
     _default_prop_index = _available.index(_default_prop) if _default_prop in _available else 0
 
-    _r1c1, _r1c2, _r1c3 = st.columns([1.6, 1.0, 1.4], gap="small")
-    with _r1c1:
-        st.caption("Prop")
-        _picked_label = st.selectbox(
-            "Prop", _available, index=_default_prop_index, key="ps_stat_pick", label_visibility="collapsed",
-        )
+    st.caption("Prop")
+    _picked_label = st.selectbox(
+        "Prop", _available, index=_default_prop_index, key="ps_stat_pick", label_visibility="collapsed",
+    )
     stat_field = PROP_STAT_MAP.get(_picked_label) or PLAYER_SEARCH_EXTRA_STATS.get(_picked_label)
 
     # Current sportsbook market data for this player/prop -- a single
@@ -213,9 +222,10 @@ def _render_prop_analysis(player: dict, ctx: dict, supabase, now_utc):
         })
 
     # Priority 2 fallback: current-season per-game average for this exact
-    # stat, from the same game log the Prop Hit Rate section below
-    # already needs -- computed once here and reused there, not fetched
-    # twice.
+    # stat. Computed here (for the live default preview, tied to whatever
+    # Prop is currently selected) and re-derived below from the submitted
+    # Prop specifically, reusing this same result when they match rather
+    # than fetching twice.
     _full_log = get_player_game_log(player["name"], player["team"], stat_field, n_games=None)
     _season_avg = None
     if _full_log:
@@ -231,12 +241,12 @@ def _render_prop_analysis(player: dict, ctx: dict, supabase, now_utc):
         _default_line, _line_source = _PROP_STATIC_FALLBACK.get(_picked_label, 0.5), "fallback"
 
     # Reinitialize the research threshold only when Player or Prop
-    # actually changes (a fresh widget key), not on every unrelated
-    # rerun (Sample Size/Side changes reuse the same key and Streamlit
-    # preserves whatever the user has typed) -- and surface currently
-    # posted lines as one-click choices when more than one is available,
-    # without letting that quick-pick keep overwriting a manual edit on
-    # later reruns.
+    # actually changes (a fresh widget key) -- and surface currently
+    # posted lines as one-click choices when more than one is available.
+    # Both the quick-pick and the Prop Line input it writes into stay
+    # reactive/outside the form for the same reason Prop does: a
+    # form-wrapped quick-pick wouldn't visibly update the Prop Line until
+    # Run Analysis was pressed, defeating the point of a one-click choice.
     _threshold_key = f"ps_threshold__{player['name']}__{_picked_label}"
     if len(_book_lines) > 1:
         _quick_pick_key = f"ps_quickline__{player['name']}__{_picked_label}"
@@ -250,29 +260,9 @@ def _render_prop_analysis(player: dict, ctx: dict, supabase, now_utc):
             st.session_state[_threshold_key] = float(_quick_pick)
             st.session_state[_quick_applied_key] = _quick_pick
 
-    with _r1c2:
-        st.caption("Prop Line")
-        _threshold = st.number_input(
-            "Prop Line", min_value=0.0, value=_default_line,
-            step=0.5, key=_threshold_key, label_visibility="collapsed",
-        )
-    with _r1c3:
-        st.caption("Sample Size")
-        _sample_label = st.selectbox(
-            "Sample Size", ["Last 5 Games", "Last 10 Games", "Season"], index=1,
-            key="ps_sample", label_visibility="collapsed",
-        )
-
-    _side_col, _ = st.columns([1.0, 3.0])
-    with _side_col:
-        _side = st.segmented_control("Side", ["Over", "Under"], default="Over",
-                                      key="ps_side", label_visibility="collapsed") or "Over"
-
-    st.markdown("<div style='margin-top:10px'></div>", unsafe_allow_html=True)
-
-    st.markdown("<div style='font-size:1.05rem;font-weight:700;margin:0 0 2px 0'>Current Market</div>", unsafe_allow_html=True)
+    st.markdown("<div style='font-size:1.05rem;font-weight:700;margin:8px 0 2px 0'>Current Market</div>", unsafe_allow_html=True)
     if not odds_market_key:
-        st.caption(f"{_picked_label} isn't tracked by sportsbooks — research the line above manually.")
+        st.caption(f"{_picked_label} isn't tracked by sportsbooks — research the line below manually.")
     elif market_line is None:
         if _line_source == "season":
             st.caption(f"No current sportsbook market yet — line defaulted to this season's average ({_season_avg:g}).")
@@ -299,35 +289,85 @@ def _render_prop_analysis(player: dict, ctx: dict, supabase, now_utc):
         else:
             st.caption("No individual sportsbook prices available for this market yet.")
 
-    st.markdown("<div style='margin-top:14px'></div>", unsafe_allow_html=True)
+    st.markdown("<div style='margin-top:10px'></div>", unsafe_allow_html=True)
+
+    # ── Everything below has no cross-control dependency, so it's the
+    # only part that benefits from being deferred to one explicit submit
+    # instead of a rerun per keystroke/click. Editing Prop Line, Sample
+    # Size, or Side inside this form causes no script rerun at all until
+    # "Run Analysis" is pressed.
+    with st.form(key=f"ps_form__{player['name']}"):
+        _fc1, _fc2 = st.columns([1.0, 1.0], gap="small")
+        with _fc1:
+            st.caption("Prop Line")
+            _threshold_input = st.number_input(
+                "Prop Line", min_value=0.0, value=_default_line,
+                step=0.5, key=_threshold_key, label_visibility="collapsed",
+            )
+        with _fc2:
+            st.caption("Sample Size")
+            _sample_label_input = st.selectbox(
+                "Sample Size", ["Last 5 Games", "Last 10 Games", "Season"], index=1,
+                key="ps_sample", label_visibility="collapsed",
+            )
+        _side_col, _btn_col = st.columns([1.0, 3.0], gap="small")
+        with _side_col:
+            _side_input = st.segmented_control("Side", ["Over", "Under"], default="Over",
+                                                key="ps_side", label_visibility="collapsed") or "Over"
+        with _btn_col:
+            _submitted = st.form_submit_button("Run Analysis", use_container_width=True)
+
+    _submission_key = f"ps_submitted__{player['name']}"
+    if _submitted:
+        st.session_state[_submission_key] = {
+            "picked_label": _picked_label, "stat_field": stat_field,
+            "side": _side_input, "threshold": _threshold_input, "sample_label": _sample_label_input,
+        }
+
+    _sub = st.session_state.get(_submission_key)
+    if not _sub:
+        st.info("Set your Prop, Prop Line, and Sample Size above, then click **Run Analysis** to see Prop Hit Rate results.")
+        return
+
+    st.markdown("<div style='margin-top:6px'></div>", unsafe_allow_html=True)
+    st.caption(
+        f"Showing results for **{_sub['picked_label']}** — {_sub['side']} {_sub['threshold']:g} "
+        f"({_sub['sample_label']})"
+    )
 
     st.markdown("## Prop Hit Rate")
     st.caption("See how often this player has cleared the selected prop line.")
 
-    _sample_n = {"Last 5 Games": 5, "Last 10 Games": 10, "Season": None}[_sample_label]
-    _dashboard_log = _full_log[:_sample_n] if _sample_n else _full_log
+    _sample_n = {"Last 5 Games": 5, "Last 10 Games": 10, "Season": None}[_sub["sample_label"]]
+    # Reuse the game log already fetched above when the submitted Prop is
+    # still the currently-selected one (the common case); only re-fetch
+    # (still a cheap, cached call) if the user changed Prop after their
+    # last submission without resubmitting yet.
+    _sub_full_log = _full_log if _sub["stat_field"] == stat_field else get_player_game_log(
+        player["name"], player["team"], _sub["stat_field"], n_games=None,
+    )
+    _dashboard_log = _sub_full_log[:_sample_n] if _sample_n else _sub_full_log
 
     render_prop_hit_rate_dashboard(
-        _picked_label, _side, _threshold, _dashboard_log, _sample_label,
+        _sub["picked_label"], _sub["side"], _sub["threshold"], _dashboard_log, _sub["sample_label"],
         current_season=get_current_season(),
     )
 
-    if _full_log:
+    if _sub_full_log:
         st.markdown("<div style='margin-top:14px'></div>", unsafe_allow_html=True)
         st.markdown("### Recent Prop Results")
         _cur_season = get_current_season()
         _log_rows = []
-        for g in _full_log[:10]:
+        for g in _sub_full_log[:10]:
             _wk = f"W{g['week']}" if g.get("season") == _cur_season else f"W{g['week']} {g.get('season')}"
             _log_rows.append({
                 # "Line" intentionally not repeated per row here — the
-                # selected research line (_threshold) is already shown in
-                # the Prop Line control above and in the Prop Hit Rate
-                # header, so a column showing the same identical value on
-                # every row would just be redundant clutter. _threshold
-                # itself is untouched and still drives Result below.
-                "Week": _wk, "Opponent": g["opponent"], _picked_label: g["value"],
-                "Result": ("Over" if g["value"] > _threshold else "Push" if g["value"] == _threshold else "Under"),
+                # submitted research line is already shown in the caption
+                # above and in the Prop Hit Rate header, so a column
+                # showing the same identical value on every row would
+                # just be redundant clutter.
+                "Week": _wk, "Opponent": g["opponent"], _sub["picked_label"]: g["value"],
+                "Result": ("Over" if g["value"] > _sub["threshold"] else "Push" if g["value"] == _sub["threshold"] else "Under"),
             })
         st.dataframe(pd.DataFrame(_log_rows), use_container_width=True, hide_index=True)
 
