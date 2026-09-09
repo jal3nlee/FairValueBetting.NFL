@@ -165,6 +165,30 @@ def _fragment_rerun() -> None:
         st.rerun()
 
 
+@st.cache_data(ttl=300, show_spinner=False)
+def _load_parlay_builder_markets(_supabase, sport_keys: frozenset, window_start, window_end, bankroll: float, kelly: float) -> dict[str, pd.DataFrame]:
+    """
+    Pure computation: fetch + price all 3 game markets, reused by Current
+    Parlay, Compare Parlay Odds, and Browse Games. Wrapped in @st.fragment
+    below via _parlay_builder_body, but a fragment only scopes reruns
+    triggered by a widget INSIDE it — a rerun triggered elsewhere in the
+    app (e.g. a Prop Research dropdown) still re-executes this tab's
+    render() top to bottom, including this fragment call. Without this
+    cache, the full 3-market devig/consensus/EV pipeline re-ran on every
+    one of those unrelated reruns for every signed-in user. Same pattern
+    as tabs/market_movers.py::_load_market_movers_data.
+    """
+    _display: dict[str, pd.DataFrame] = {}
+    for _mkt_key, _mkt_cfg in MARKETS.items():
+        _raw_pb, _ = fetch_market_lines(_supabase, sport_keys, _mkt_cfg.db_market_key)
+        _raw_pb = filter_by_window(_raw_pb, window_start, window_end)
+        _display[_mkt_key] = run_market_pipeline(
+            raw_lines=_raw_pb, cfg=_mkt_cfg, bankroll=bankroll, kelly=kelly,
+            min_ev=0.0, min_fair_pct=0.0, show_all=True,
+        )
+    return _display
+
+
 def render(supabase, now_utc, eff_bankroll, eff_kelly, authed):
     if not authed:
         st.warning("Sign in to use the Parlay Builder.")
@@ -193,14 +217,9 @@ def render(supabase, now_utc, eff_bankroll, eff_kelly, authed):
         # Compare Parlay Odds (fair-probability lookup for EV%), and
         # Browse Games — no new fetch is introduced by any of these three
         # consumers needing the same already-fetched pipeline output.
-        _pb_display: dict[str, pd.DataFrame] = {}
-        for _mkt_key, _mkt_cfg in MARKETS.items():
-            _raw_pb, _ = fetch_market_lines(supabase, sport_keys, _mkt_cfg.db_market_key)
-            _raw_pb = filter_by_window(_raw_pb, window_start, window_end)
-            _pb_display[_mkt_key] = run_market_pipeline(
-                raw_lines=_raw_pb, cfg=_mkt_cfg, bankroll=eff_bankroll, kelly=eff_kelly,
-                min_ev=0.0, min_fair_pct=0.0, show_all=True,
-            )
+        _pb_display = _load_parlay_builder_markets(
+            supabase, frozenset(sport_keys), window_start, window_end, eff_bankroll, eff_kelly,
+        )
         df_all = (
             pd.concat([df for df in _pb_display.values() if not df.empty], ignore_index=True)
             if any(not df.empty for df in _pb_display.values())

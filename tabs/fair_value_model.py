@@ -118,6 +118,35 @@ def _prop_bet_label(row) -> str:
     return f"{player} {side}{line_part} {market}".replace("  ", " ").strip()
 
 
+@st.cache_data(ttl=300, show_spinner=False)
+def _load_fvm_player_props(_supabase, event_ids: tuple, window_start, window_end, bankroll: float, kelly: float):
+    """
+    Pure computation: fetch + price every approved player-prop market for
+    Fair Value Model's Player Props view. Same rationale as
+    _load_fvm_game_markets above — this ran unconditionally on every
+    app-wide rerun (no gate beyond `authed`, checked earlier in render())
+    even though the underlying Supabase reads (get_upcoming_prop_event_ids,
+    fetch_prop_market_lines) are already cached. event_ids is a tuple
+    (hashable) rather than the list get_upcoming_prop_event_ids returns.
+    """
+    _all_raw_props: dict[str, pd.DataFrame] = {}
+    _all_prop_display = []
+    for mkt_key, mkt_cfg in PROP_MARKETS.items():
+        if not event_ids:
+            _all_raw_props[mkt_key] = pd.DataFrame()
+            continue
+        raw = fetch_prop_market_lines(_supabase, list(event_ids), mkt_key)
+        raw_filtered = filter_by_window(raw, window_start, window_end)
+        _all_raw_props[mkt_key] = raw_filtered
+        df = run_prop_market_pipeline(
+            raw_lines=raw_filtered, cfg=mkt_cfg, bankroll=bankroll, kelly=kelly,
+            min_ev=0.0, min_fair_pct=0.0, show_all=True,
+        )
+        if not df.empty:
+            _all_prop_display.append(df)
+    return _all_raw_props, _all_prop_display
+
+
 def _render_player_props(supabase, now_utc, eff_bankroll, eff_kelly, debug_mode=False):
     """
     Player Props view — Phase 1. Runs the exact same generic fair-value
@@ -151,23 +180,11 @@ def _render_player_props(supabase, now_utc, eff_bankroll, eff_kelly, debug_mode=
         _odds_format = st.selectbox("Odds Format", _format_options, key="fvm_prop_odds_format")
 
     # ── Load all approved prop markets ───────────────────────
-    all_raw_props: dict[str, pd.DataFrame] = {}
-    all_prop_display = []
     with st.spinner("Loading NFL player props..."):
         event_ids = get_upcoming_prop_event_ids(supabase, window_start.isoformat(), window_end.isoformat())
-        for mkt_key, mkt_cfg in PROP_MARKETS.items():
-            if not event_ids:
-                all_raw_props[mkt_key] = pd.DataFrame()
-                continue
-            raw = fetch_prop_market_lines(supabase, event_ids, mkt_key)
-            raw_filtered = filter_by_window(raw, window_start, window_end)
-            all_raw_props[mkt_key] = raw_filtered
-            df = run_prop_market_pipeline(
-                raw_lines=raw_filtered, cfg=mkt_cfg, bankroll=eff_bankroll, kelly=eff_kelly,
-                min_ev=0.0, min_fair_pct=0.0, show_all=True,
-            )
-            if not df.empty:
-                all_prop_display.append(df)
+        all_raw_props, all_prop_display = _load_fvm_player_props(
+            supabase, tuple(event_ids), window_start, window_end, eff_bankroll, eff_kelly,
+        )
 
     df_props = pd.concat(all_prop_display, ignore_index=True) if all_prop_display else pd.DataFrame()
 
@@ -342,6 +359,35 @@ def _render_player_props(supabase, now_utc, eff_bankroll, eff_kelly, debug_mode=
         )
 
 
+@st.cache_data(ttl=300, show_spinner=False)
+def _load_fvm_game_markets(_supabase, sport_keys: frozenset, window_start, window_end, bankroll: float, kelly: float):
+    """
+    Pure computation: fetch + price all 3 game markets for Fair Value
+    Model's Game Markets view. st.tabs() re-executes every tab's render()
+    on every app-wide widget interaction; this tab is gated on `authed`
+    but not on anything else, so for a signed-in user the full 3-market
+    devig/consensus/EV pipeline was re-running on every unrelated click
+    anywhere in the app (e.g. a Prop Research dropdown) even though the
+    underlying Supabase reads are already cached. Same pattern as
+    tabs/market_movers.py::_load_market_movers_data. Only used on the
+    debug_mode=False path (the default, DEBUG_MODE=False in app.py) —
+    debug_mode needs live PipelineTrace objects mutated during the run,
+    which a cache hit would skip populating, so that path keeps calling
+    run_market_pipeline directly and uncached, exactly as before.
+    """
+    _all_raw: dict[str, pd.DataFrame] = {}
+    _all_display: dict[str, pd.DataFrame] = {}
+    for mkt_key, mkt_cfg in MARKETS.items():
+        raw, _pulled = fetch_market_lines(_supabase, sport_keys, mkt_cfg.db_market_key)
+        raw_filtered = filter_by_window(raw, window_start, window_end)
+        _all_raw[mkt_key] = raw_filtered
+        _all_display[mkt_key] = run_market_pipeline(
+            raw_lines=raw_filtered, cfg=mkt_cfg, bankroll=bankroll, kelly=kelly,
+            min_ev=0.0, min_fair_pct=0.0, show_all=True,
+        )
+    return _all_raw, _all_display
+
+
 def render(supabase, now_utc, eff_bankroll, eff_kelly, authed, debug_mode=False):
     market_movers.render(supabase, now_utc, eff_bankroll, eff_kelly)
 
@@ -386,23 +432,30 @@ def render(supabase, now_utc, eff_bankroll, eff_kelly, authed, debug_mode=False)
     all_raw: dict[str, pd.DataFrame] = {}
     all_display: dict[str, pd.DataFrame] = {}
     all_traces: dict[str, PipelineTrace] = {}
-    pulled_times: list = []
 
     with st.spinner("Loading NFL odds..."):
-        for mkt_key, mkt_cfg in MARKETS.items():
-            trace = PipelineTrace(market=mkt_cfg.name)
-            all_traces[mkt_key] = trace
-            raw, pulled = fetch_market_lines(supabase, sport_keys, mkt_cfg.db_market_key)
-            trace.raw = len(raw)
-            raw_filtered = filter_by_window(raw, window_start, window_end)
-            trace.after_window = len(raw_filtered)
-            all_raw[mkt_key] = raw_filtered
-            pulled_times.extend(pulled)
-            df = run_market_pipeline(
-                raw_lines=raw_filtered, cfg=mkt_cfg, bankroll=eff_bankroll, kelly=eff_kelly,
-                min_ev=0.0, min_fair_pct=0.0, show_all=True, trace=trace,
+        if debug_mode:
+            # Uncached: debug_mode needs a live PipelineTrace mutated
+            # during each run, which a cached call wouldn't populate on a
+            # cache hit. DEBUG_MODE defaults to False in app.py, so the
+            # common path is the cached branch below.
+            for mkt_key, mkt_cfg in MARKETS.items():
+                trace = PipelineTrace(market=mkt_cfg.name)
+                all_traces[mkt_key] = trace
+                raw, _pulled = fetch_market_lines(supabase, sport_keys, mkt_cfg.db_market_key)
+                trace.raw = len(raw)
+                raw_filtered = filter_by_window(raw, window_start, window_end)
+                trace.after_window = len(raw_filtered)
+                all_raw[mkt_key] = raw_filtered
+                df = run_market_pipeline(
+                    raw_lines=raw_filtered, cfg=mkt_cfg, bankroll=eff_bankroll, kelly=eff_kelly,
+                    min_ev=0.0, min_fair_pct=0.0, show_all=True, trace=trace,
+                )
+                all_display[mkt_key] = df
+        else:
+            all_raw, all_display = _load_fvm_game_markets(
+                supabase, frozenset(sport_keys), window_start, window_end, eff_bankroll, eff_kelly,
             )
-            all_display[mkt_key] = df
 
     df_all = (
         pd.concat([df for df in all_display.values() if not df.empty], ignore_index=True)

@@ -618,11 +618,18 @@ def calculate_hit_rate(game_log: list[dict], line: float, side: str = "Over") ->
 
 @st.cache_data(ttl=6 * 3600, show_spinner=False)
 def _all_player_weekly_rows(season: int) -> list[dict]:
-    stats = _load_player_stats(season)
-    if stats is None:
-        return []
+    """Raises if the underlying season data isn't available, mirroring
+    _weekly_rows_for_player's own fix above — st.cache_data must never
+    cache a transient nflreadpy failure as "no players this season" for
+    the full 6h TTL. Previously called _load_player_stats, which
+    swallows any failure into None, so a blip on the very first call for
+    a season got a [] result cached here for 6 hours, indistinguishable
+    from a genuine (but nonexistent) no-data season."""
+    player_stats = _load_player_stats(season)
+    if player_stats is None:
+        raise RuntimeError(f"player stats unavailable for season {season}")
     try:
-        return stats.to_dicts()
+        return player_stats.to_dicts()
     except Exception:
         return []
 
@@ -636,10 +643,37 @@ def build_prop_leaderboard(stat_label: str, side: str, line: float, sample_label
     getting sparse or misleading results. Candidate construction,
     eligibility, hit-rate calculation, and ranking are unchanged — this
     only makes the final truncation step optional.
+
+    This outer wrapper stays uncached and resolves the season first,
+    exactly like get_current_season()'s own callers elsewhere in this
+    module — a transient failure here must be retried on the next rerun,
+    not cached as an empty leaderboard for hours. The actual league-wide
+    scan is delegated to _cached_build_prop_leaderboard below, which IS
+    cached (and can raise on a genuine data-fetch failure, caught here).
     """
     season = get_current_season()
     if season is None:
         return []
+    try:
+        return _cached_build_prop_leaderboard(season, stat_label, side, line, sample_label, limit)
+    except Exception:
+        return []
+
+
+@st.cache_data(ttl=6 * 3600, show_spinner=False)
+def _cached_build_prop_leaderboard(season: int, stat_label: str, side: str, line: float, sample_label: str, limit: int | None) -> list[dict]:
+    """
+    Scans every player-week row for the whole league (_all_player_weekly_rows,
+    itself cached and failure-isolated) and was being redone from scratch
+    on every rerun of Prop Leaderboard's render — including reruns
+    triggered by an unrelated widget elsewhere in the app — even though
+    its own inputs only change when the user actually edits a filter and
+    submits. TTL matches _all_player_weekly_rows' own 6h TTL, so this
+    adds no staleness beyond what's already accepted for the underlying
+    data. season is passed in already-resolved by build_prop_leaderboard
+    above rather than re-derived here, so a season-lookup failure can
+    never be masked by this function's own cache.
+    """
     field = PROP_STAT_MAP.get(stat_label)
     eligible_positions = PROP_POSITION_MAP.get(stat_label, [])
     n_games = SAMPLE_OPTIONS.get(sample_label)

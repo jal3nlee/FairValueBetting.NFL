@@ -64,50 +64,56 @@ def _fmt_usage_val(v, is_pct):
 
 
 def render_leaderboard_view(supabase, now_utc):
-    _c1, _c2, _c3 = st.columns(3)
-    with _c1:
-        stat_label = st.selectbox("Prop", list(PROP_STAT_MAP.keys()), key="pl_stat")
-    with _c2:
-        side = st.selectbox("Over/Under", ["Over", "Under"], key="pl_side")
-    with _c3:
-        line = st.number_input("Prop Line", min_value=0.0, value=49.5, step=0.5, key="pl_line")
+    """
+    All filters (Prop, Over/Under, Prop Line, Sample Size, Team) live
+    inside one st.form: none of them determine another control's options
+    or defaults (unlike Player Research's Prop selector, which does), so
+    there's no reason for any of them to be reactive. Editing any filter
+    causes zero script rerun until "Find Top 10" is pressed. The
+    expensive league-wide scan (build_prop_leaderboard) runs only from a
+    submission snapshot (st.session_state["pl_submitted"]), never from
+    live widget values, so a filter edit after results exist never
+    silently recomputes them — previous results stay visible, captioned
+    with exactly what they're showing, until the next submit.
+    """
+    _team_pairs = get_nfl_team_names()  # cached nflreadpy team table, no new fetch
+    _team_options = ["All Teams"] + [name for name, _abbr in _team_pairs]
 
-    # Sample Size (query-defining) shares this row with Team, the one
-    # lightweight narrowing control — Team is not a query-defining input.
-    # It only ever filters an already-fetched, already-ranked result set
-    # locally (see below), never re-triggers the league scan. Eligible
-    # positions for the selected prop are still enforced internally by
-    # build_prop_leaderboard via PROP_POSITION_MAP (unchanged) — there's
-    # just no separate Position narrowing control in this UI.
-    _f1, _f2, _f3 = st.columns(3)
-    with _f1:
-        sample_label = st.selectbox("Sample Size", list(SAMPLE_OPTIONS.keys()), index=1, key="pl_sample")
-    with _f2:
-        _team_pairs = get_nfl_team_names()  # cached nflreadpy team table, no new fetch
-        _team_options = ["All Teams"] + [name for name, _abbr in _team_pairs]
-        _team_choice = st.selectbox("Team", _team_options, key="pl_team")
-    with _f3:
-        st.markdown("<div style='height:1.9rem'></div>", unsafe_allow_html=True)
-        _run = st.button("Find Top 10", type="primary", key="pl_run", use_container_width=True)
+    with st.form(key="pl_form"):
+        _c1, _c2, _c3 = st.columns(3)
+        with _c1:
+            _stat_label_input = st.selectbox("Prop", list(PROP_STAT_MAP.keys()), key="pl_stat")
+        with _c2:
+            _side_input = st.selectbox("Over/Under", ["Over", "Under"], key="pl_side")
+        with _c3:
+            _line_input = st.number_input("Prop Line", min_value=0.0, value=49.5, step=0.5, key="pl_line")
 
-    st.markdown(f"### {side} {line:g} {stat_label}")
-    st.caption(sample_label)
+        # Eligible positions for the selected prop are still enforced
+        # internally by build_prop_leaderboard via PROP_POSITION_MAP
+        # (unchanged) — there's just no separate Position narrowing
+        # control in this UI.
+        _f1, _f2, _f3 = st.columns(3)
+        with _f1:
+            _sample_label_input = st.selectbox("Sample Size", list(SAMPLE_OPTIONS.keys()), index=1, key="pl_sample")
+        with _f2:
+            _team_choice_input = st.selectbox("Team", _team_options, key="pl_team")
+        with _f3:
+            st.markdown("<div style='height:1.9rem'></div>", unsafe_allow_html=True)
+            _run = st.form_submit_button("Find Top 10", type="primary", use_container_width=True)
 
-    # Prop/Over-Under/Line/Sample define the analysis and are the only
-    # inputs that invalidate a prior search — Team is deliberately
-    # excluded from this query identity (same shape as the proven MLB
-    # pattern), so changing only Team never resets "has_run" back to the
-    # placeholder and never requires another Find Top 10 press.
-    _query_key = (stat_label, side, line, sample_label)
-    if st.session_state.get("pl_query_key") != _query_key:
-        st.session_state["pl_has_run"] = False
     if _run:
-        st.session_state["pl_has_run"] = True
-        st.session_state["pl_query_key"] = _query_key
+        st.session_state["pl_submitted"] = {
+            "stat_label": _stat_label_input, "side": _side_input, "line": _line_input,
+            "sample_label": _sample_label_input, "team_choice": _team_choice_input,
+        }
 
-    if not st.session_state.get("pl_has_run"):
+    _sub = st.session_state.get("pl_submitted")
+    if not _sub:
         st.info("Set your filters above and click **Find Top 10** to run the search.")
         return
+
+    st.markdown(f"### {_sub['side']} {_sub['line']:g} {_sub['stat_label']}")
+    st.caption(_sub["sample_label"])
 
     with st.spinner("Scanning current-season player data..."):
         # limit=None: the full sorted candidate list, so Team/Position can
@@ -117,7 +123,9 @@ def render_leaderboard_view(supabase, now_utc):
         # the unfiltered league-wide top 10. Candidate construction,
         # eligibility, hit-rate calculation, and ranking are all unchanged
         # inside build_prop_leaderboard; only truncation moved here.
-        all_results = build_prop_leaderboard(stat_label, side, line, sample_label, limit=None)
+        all_results = build_prop_leaderboard(
+            _sub["stat_label"], _sub["side"], _sub["line"], _sub["sample_label"], limit=None,
+        )
 
     if not all_results:
         st.info(
@@ -132,13 +140,13 @@ def render_leaderboard_view(supabase, now_utc):
     # is pure filtering, not a lookup.
     results = all_results
     _team_abbr_by_name = dict(_team_pairs)
-    if _team_choice != "All Teams":
-        _team_abbr = _team_abbr_by_name.get(_team_choice)
+    if _sub["team_choice"] != "All Teams":
+        _team_abbr = _team_abbr_by_name.get(_sub["team_choice"])
         results = [r for r in results if r["team"] == _team_abbr]
     results = results[:10]
 
     if not results:
-        st.info(f"No qualifying {stat_label.lower()} results for {_team_choice} with the current filters.")
+        st.info(f"No qualifying {_sub['stat_label'].lower()} results for {_sub['team_choice']} with the current filters.")
         return
 
     # Full team names for display only — reuses the same already-fetched
@@ -147,7 +155,7 @@ def render_leaderboard_view(supabase, now_utc):
     # matching the "team" field build_prop_leaderboard actually returns.
     _team_name_by_abbr = {abbr: name for name, abbr in _team_pairs}
 
-    avg_label = PROP_AVG_LABEL.get(stat_label, "Avg")
+    avg_label = PROP_AVG_LABEL.get(_sub["stat_label"], "Avg")
     rows = []
     for i, r in enumerate(results, 1):
         rows.append({

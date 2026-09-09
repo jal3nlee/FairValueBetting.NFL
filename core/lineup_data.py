@@ -164,9 +164,24 @@ def get_players_by_position(team_abbr: str, position: str) -> list[dict]:
 
 
 def get_team_game_context(supabase, team_name: str, now_utc) -> dict:
+    """Thin wrapper: buckets now_utc to the nearest 5 minutes (matching
+    fetch_market_lines' own underlying 300s cache TTL) so the real work
+    below can be memoized by st.cache_data — a raw now_utc would differ
+    on every call and never repeat as a cache key. Callers (Prop
+    Research's Player Research view, Lineup Analysis, per-player in
+    build_player_comparison) each call this once per player on every
+    rerun of their tab, including reruns triggered by a widget elsewhere
+    in the app entirely."""
+    _bucket = now_utc.replace(second=0, microsecond=0)
+    _bucket = _bucket.replace(minute=(_bucket.minute // 5) * 5)
+    return _cached_team_game_context(supabase, team_name, _bucket)
+
+
+@st.cache_data(ttl=300, show_spinner=False)
+def _cached_team_game_context(_supabase, team_name: str, now_utc) -> dict:
     window_start, window_end, sport_keys, _ = get_date_window(now_utc, "Next 7 Days")
 
-    raw, _ = fetch_market_lines(supabase, sport_keys, "spread")
+    raw, _ = fetch_market_lines(_supabase, sport_keys, "spread")
     if raw.empty:
         return {}
     # "side" must be pinned to "home" here: odds_lines carries one row per
@@ -187,7 +202,7 @@ def get_team_game_context(supabase, team_name: str, now_utc) -> dict:
     is_home = g["home_team"] == team_name
     opponent = g["away_team"] if is_home else g["home_team"]
 
-    total_raw, _ = fetch_market_lines(supabase, sport_keys, "total")
+    total_raw, _ = fetch_market_lines(_supabase, sport_keys, "total")
     total_game = total_raw[total_raw["event_id"] == g["event_id"]]
     game_total = None
     if not total_game.empty and "line" in total_game.columns:

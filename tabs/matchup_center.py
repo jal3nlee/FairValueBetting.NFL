@@ -100,6 +100,30 @@ def _build_snap_rows(source: pd.DataFrame, odds_format: str) -> list[dict]:
     return rows
 
 
+@st.cache_data(ttl=300, show_spinner=False)
+def _load_matchup_center_markets(_supabase, sport_keys: frozenset, window_start, window_end, bankroll: float, kelly: float) -> dict[str, pd.DataFrame]:
+    """
+    Pure computation: fetch + price all 3 game markets for Matchup
+    Center. st.tabs() re-executes every tab's render() on every app-wide
+    widget interaction, and this tab has no auth gate, so without this
+    the full 3-market devig/consensus/EV pipeline re-ran on every
+    unrelated click anywhere in the app (e.g. a Prop Research dropdown)
+    even though the underlying Supabase reads are already cached. Same
+    pattern as tabs/market_movers.py::_load_market_movers_data. Cache key
+    uses window_start/window_end (already resolved from the user's Date
+    Range choice) rather than raw now_utc.
+    """
+    _display: dict[str, pd.DataFrame] = {}
+    for _mkt_key, _mkt_cfg in MARKETS.items():
+        _raw_mc, _pulled = fetch_market_lines(_supabase, sport_keys, _mkt_cfg.db_market_key)
+        _raw_mc = filter_by_window(_raw_mc, window_start, window_end)
+        _display[_mkt_key] = run_market_pipeline(
+            raw_lines=_raw_mc, cfg=_mkt_cfg, bankroll=bankroll, kelly=kelly,
+            min_ev=0.0, min_fair_pct=0.0, show_all=True,
+        )
+    return _display
+
+
 def render(supabase, now_utc, eff_bankroll, eff_kelly):
     st.markdown("## Matchup Center")
 
@@ -121,14 +145,9 @@ def render(supabase, now_utc, eff_bankroll, eff_kelly):
         "Click a matchup to open the full research breakdown."
     )
 
-    _mc_display: dict[str, pd.DataFrame] = {}
-    for _mkt_key, _mkt_cfg in MARKETS.items():
-        _raw_mc, _pulled = fetch_market_lines(supabase, sport_keys, _mkt_cfg.db_market_key)
-        _raw_mc = filter_by_window(_raw_mc, window_start, window_end)
-        _mc_display[_mkt_key] = run_market_pipeline(
-            raw_lines=_raw_mc, cfg=_mkt_cfg, bankroll=eff_bankroll, kelly=eff_kelly,
-            min_ev=0.0, min_fair_pct=0.0, show_all=True,
-        )
+    _mc_display = _load_matchup_center_markets(
+        supabase, frozenset(sport_keys), window_start, window_end, eff_bankroll, eff_kelly,
+    )
     _df_mc = (
         pd.concat([df for df in _mc_display.values() if not df.empty], ignore_index=True)
         if any(not df.empty for df in _mc_display.values())
