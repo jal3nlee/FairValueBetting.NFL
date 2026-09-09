@@ -18,6 +18,7 @@ def render_nfl_player_search(
     key_prefix: str,
     allowed_positions: list[str] | None = None,
     taken_names: set[str] | None = None,
+    show_label: bool = True,
 ) -> dict | None:
     """
     Renders the standardized Team | Position | Load Roster controls (one
@@ -54,10 +55,16 @@ def render_nfl_player_search(
     allowed_positions = allowed_positions or ["QB", "RB", "WR", "TE"]
     taken_names = taken_names or set()
 
-    st.markdown(
-        "<div style='font-size:0.95rem;font-weight:600;margin:0 0 4px 0'>Player Search</div>",
-        unsafe_allow_html=True,
-    )
+    # show_label=False lets a caller that already renders its own "Player
+    # Search" section heading (e.g. Prop Research) skip this internal
+    # label instead of showing it twice. Defaults to True so Lineup
+    # Analysis — which relies on this internal label as its only "Player
+    # Search" text — is unaffected.
+    if show_label:
+        st.markdown(
+            "<div style='font-size:0.95rem;font-weight:600;margin:0 0 4px 0'>Player Search</div>",
+            unsafe_allow_html=True,
+        )
 
     _c1, _c2, _c3 = st.columns([2.2, 1.2, 2.6])
     with _c1:

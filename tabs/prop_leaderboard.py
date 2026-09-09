@@ -249,33 +249,27 @@ def _render_prop_analysis(player: dict, ctx: dict, supabase, now_utc):
         _default_line, _line_source = _PROP_STATIC_FALLBACK.get(_picked_label, 0.5), "fallback"
 
     # Reinitialize the research threshold only when Player or Prop
-    # actually changes (a fresh widget key) -- and surface currently
-    # posted lines as one-click choices when more than one is available.
-    # Both the quick-pick and the Prop Line input it writes into stay
-    # reactive/outside the form for the same reason Prop does: a
-    # form-wrapped quick-pick wouldn't visibly update the Prop Line until
-    # Run Analysis was pressed, defeating the point of a one-click choice.
+    # actually changes (a fresh widget key). _threshold_key must be
+    # computed here regardless of which Current Market branch fires below
+    # -- the quick-pick block further down writes into it before the Prop
+    # Line widget with this same key is created inside the form.
     _threshold_key = f"ps_threshold__{player['name']}__{_picked_label}"
-    if len(_book_lines) > 1:
-        _quick_pick_key = f"ps_quickline__{player['name']}__{_picked_label}"
-        _quick_applied_key = f"{_quick_pick_key}__applied"
-        st.caption("Market Lines")
-        _quick_pick = st.segmented_control(
-            "Market Lines", [f"{l:g}" for l in _book_lines],
-            key=_quick_pick_key, label_visibility="collapsed",
-        )
-        if _quick_pick is not None and st.session_state.get(_quick_applied_key) != _quick_pick:
-            st.session_state[_threshold_key] = float(_quick_pick)
-            st.session_state[_quick_applied_key] = _quick_pick
 
-    st.markdown("<div style='font-size:1.05rem;font-weight:700;margin:8px 0 2px 0'>Current Market</div>", unsafe_allow_html=True)
+    # ── Current Market: one prominent line + a short "N sportsbooks
+    # posted" secondary line, instead of a separate "Current Market"
+    # heading stacked on top of a second "Current Market Line: ..."
+    # line repeating the same information. ──
     if not odds_market_key:
+        st.markdown("<div style='font-size:1.05rem;font-weight:700;margin:8px 0 2px 0'>Current Market</div>", unsafe_allow_html=True)
         st.caption(f"{_picked_label} isn't tracked by sportsbooks — research the line below manually.")
+        _book_rows = {}
     elif market_line is None:
+        st.markdown("<div style='font-size:1.05rem;font-weight:700;margin:8px 0 2px 0'>Current Market</div>", unsafe_allow_html=True)
         if _line_source == "season":
             st.caption(f"No current sportsbook market yet — line defaulted to this season's average ({_season_avg:g}).")
         else:
             st.caption("Player props are not available yet. Check back closer to kickoff.")
+        _book_rows = {}
     else:
         _book_rows = {}
         for r in prop_rows:
@@ -289,13 +283,33 @@ def _render_prop_analysis(player: dict, ctx: dict, supabase, now_utc):
                 _book_rows[b]["Under"] = _fmt_odds(r.get("price"))
         _n_books = len(_book_rows)
         st.markdown(
-            f"**Current Market Line: {market_line:g}** "
-            f"({_n_books} book{'s' if _n_books != 1 else ''} currently posted)"
+            f"<div style='font-size:1.3rem;font-weight:800;margin:8px 0 0 0'>Current Market: {market_line:g}</div>"
+            f"<div style='opacity:0.6;font-size:0.85rem;margin-top:2px'>"
+            f"{_n_books} sportsbook{'s' if _n_books != 1 else ''} currently posted</div>",
+            unsafe_allow_html=True,
         )
         if _book_rows:
-            st.dataframe(pd.DataFrame(list(_book_rows.values())), use_container_width=True, hide_index=True)
+            with st.expander("View sportsbook lines"):
+                st.dataframe(pd.DataFrame(list(_book_rows.values())), use_container_width=True, hide_index=True)
         else:
             st.caption("No individual sportsbook prices available for this market yet.")
+
+    # Market Lines quick-picks -- shown after the Current Market line, on
+    # the exact same trigger condition as before (more than one distinct
+    # posted line); only the visual position moved. Still writes into
+    # _threshold_key before the Prop Line widget below is created, so a
+    # pick is reflected immediately.
+    if len(_book_lines) > 1:
+        _quick_pick_key = f"ps_quickline__{player['name']}__{_picked_label}"
+        _quick_applied_key = f"{_quick_pick_key}__applied"
+        st.caption("Market Lines")
+        _quick_pick = st.segmented_control(
+            "Market Lines", [f"{l:g}" for l in _book_lines],
+            key=_quick_pick_key, label_visibility="collapsed",
+        )
+        if _quick_pick is not None and st.session_state.get(_quick_applied_key) != _quick_pick:
+            st.session_state[_threshold_key] = float(_quick_pick)
+            st.session_state[_quick_applied_key] = _quick_pick
 
     st.markdown("<div style='margin-top:10px'></div>", unsafe_allow_html=True)
 
@@ -318,12 +332,14 @@ def _render_prop_analysis(player: dict, ctx: dict, supabase, now_utc):
                 "Sample Size", ["Last 5 Games", "Last 10 Games", "Season"], index=1,
                 key="ps_sample", label_visibility="collapsed",
             )
-        _side_col, _btn_col = st.columns([1.0, 3.0], gap="small")
+        _side_col, _btn_col = st.columns([1.0, 1.0], gap="small")
         with _side_col:
+            st.caption("Side")
             _side_input = st.segmented_control("Side", ["Over", "Under"], default="Over",
                                                 key="ps_side", label_visibility="collapsed") or "Over"
         with _btn_col:
-            _submitted = st.form_submit_button("Run Analysis", use_container_width=True)
+            st.markdown("<div style='height:1.9rem'></div>", unsafe_allow_html=True)
+            _submitted = st.form_submit_button("Run Analysis", type="primary", use_container_width=True)
 
     _submission_key = f"ps_submitted__{player['name']}"
     if _submitted:
@@ -339,8 +355,7 @@ def _render_prop_analysis(player: dict, ctx: dict, supabase, now_utc):
 
     st.markdown("<div style='margin-top:6px'></div>", unsafe_allow_html=True)
     st.caption(
-        f"Showing results for **{_sub['picked_label']}** — {_sub['side']} {_sub['threshold']:g} "
-        f"({_sub['sample_label']})"
+        f"Analysis: {_sub['picked_label']} · {_sub['side']} {_sub['threshold']:g} · {_sub['sample_label']}"
     )
 
     st.markdown("## Prop Hit Rate")
@@ -443,7 +458,7 @@ def render_player_research_view(supabase, now_utc):
     # loaded roster has no eligible players — the widget itself already
     # gives the right feedback for each case (a Load Players button, or a
     # disabled "No eligible players" selectbox), so nothing else to show here.
-    player = render_nfl_player_search("ps_slot", allowed_positions=["QB", "RB", "WR", "TE"])
+    player = render_nfl_player_search("ps_slot", allowed_positions=["QB", "RB", "WR", "TE"], show_label=False)
     if not player:
         return
 

@@ -109,7 +109,7 @@ def render_prop_hit_rate_dashboard(
                 unsafe_allow_html=True,
             )
             _m1, _m2 = st.columns(2)
-            _m1.metric("Average", f"{avg_val:.1f}")
+            _m1.metric(f"Avg. {stat_label}", f"{avg_val:.1f}")
             if streak_count is not None:
                 _word = "over" + ("s" if streak_count != 1 else "") if streak_class == "Over" else "under" + ("s" if streak_count != 1 else "")
                 _m2.metric("Current Streak", f"{streak_count} {_word}")
@@ -140,7 +140,18 @@ def render_prop_hit_rate_dashboard(
                 alt.Chart(pd.DataFrame({"y": [line]}))
                 .mark_rule(color="#e74c3c", strokeDash=[4, 3]).encode(y="y:Q")
             )
-            st.altair_chart((_bars + _rule).properties(height=220), use_container_width=True)
+            # Text mark anchored to the most recent (rightmost) bar's own
+            # x-category, rather than a fixed pixel position -- works
+            # regardless of how many games are in the sample, with no
+            # extra scale/axis changes and no effect on bar colors,
+            # values, or week ordering.
+            _last_label = _chart_df["Label"].iloc[-1]
+            _rule_label = (
+                alt.Chart(pd.DataFrame({"y": [line], "x": [_last_label], "text": [f"Prop Line {line:g}"]}))
+                .mark_text(align="right", baseline="bottom", dy=-4, color="#e74c3c", fontSize=11)
+                .encode(x=alt.X("x:N", sort=None), y="y:Q", text="text:N")
+            )
+            st.altair_chart((_bars + _rule + _rule_label).properties(height=220), use_container_width=True)
         except Exception:
             _chart_rows = list(reversed(game_log_newest_first))
             _indicators = " ".join(
