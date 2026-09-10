@@ -563,7 +563,53 @@ def get_recent_games(player_name: str, team_full_name: str, position: str, n: in
         return []
 
 
-def get_player_game_log(player_name: str, team_full_name: str, stat_field: str, n_games: int | None = 10) -> list[dict]:
+@st.cache_data(ttl=6 * 3600, show_spinner=False)
+def _season_rows_for_player_by_name(season: int, player_name: str) -> list[dict]:
+    """
+    Same season-scoped weekly rows as _weekly_rows_for_player, but
+    matched by player name only -- no team_abbr filter. Used exclusively
+    by get_player_game_log's cross-season lookback (below) to fetch the
+    PRIOR season: a player may have been on a different team last season
+    than their current one, and filtering prior-season rows by the
+    player's CURRENT team abbreviation (as _weekly_rows_for_player does)
+    would incorrectly exclude every one of their prior-season games.
+
+    Does not compute _carry_share/_total_td (the team-scoped derived
+    fields _build_weekly_rows adds) -- no prop stat sourced through
+    get_player_game_log needs them; Anytime TD is derived directly from
+    raw rushing_tds/receiving_tds/passing_tds below, not from
+    _total_td. Raises on a genuine fetch failure, mirroring
+    _weekly_rows_for_player / _all_player_weekly_rows, so a transient
+    nflreadpy blip is never cached as "no rows this season."
+    """
+    player_stats = _load_player_stats(season)
+    if player_stats is None:
+        raise RuntimeError(f"player stats unavailable for season {season}")
+    target_name = _norm_name(player_name)
+    rows = player_stats.to_dicts()
+    rows = [r for r in rows if _norm_name(r.get("player_display_name") or r.get("player_name") or "") == target_name]
+    rows.sort(key=lambda r: (r.get("season", 0), r.get("week", 0)))
+    return rows
+
+
+def get_player_game_log(
+    player_name: str, team_full_name: str, stat_field: str, n_games: int | None = 10,
+    cross_season: bool = False,
+) -> list[dict]:
+    """
+    cross_season=True (only meaningful when n_games is a specific
+    number, e.g. Prop Research's "Last 5/10 Games" sample size) reaches
+    back into the immediately prior season for just enough of its most
+    recent games to fill the requested count, when the current season
+    alone doesn't have n_games worth of data yet -- the early-season
+    case where e.g. only 2 current-season games exist and the user asked
+    for the Last 10. Defaults to False, and n_games=None always skips
+    this regardless of the flag: both preserve the exact prior behavior
+    for every other caller, in particular the Current-Season Average
+    fallback (called with n_games=None), which must stay current-season
+    only by design -- distinct from this historical hit-rate sample,
+    which is allowed to cross the season boundary.
+    """
     if not _NFLVERSE_AVAILABLE:
         return []
     try:
@@ -575,25 +621,44 @@ def get_player_game_log(player_name: str, team_full_name: str, stat_field: str, 
         if not team_abbr:
             return []
         rows = _weekly_rows_for_player(season, player_name, team_abbr)
-        if not rows:
-            return []
 
-        out = []
-        for r in rows:
-            if stat_field == "_any_td":
-                rush_td = r.get("rushing_tds") or 0
-                rec_td = r.get("receiving_tds") or 0
-                pass_td = r.get("passing_tds") or 0
-                val = 1.0 if (rush_td + rec_td + pass_td) > 0 else 0.0
-            else:
-                val = r.get(stat_field)
-            if val is None:
-                continue
-            out.append({
-                "week": r.get("week"), "opponent": r.get("opponent_team", "—"),
-                "value": float(val), "season": r.get("season", season),
-            })
+        def _extract(rows_list, fallback_season):
+            out = []
+            for r in rows_list:
+                if stat_field == "_any_td":
+                    rush_td = r.get("rushing_tds") or 0
+                    rec_td = r.get("receiving_tds") or 0
+                    pass_td = r.get("passing_tds") or 0
+                    val = 1.0 if (rush_td + rec_td + pass_td) > 0 else 0.0
+                else:
+                    val = r.get(stat_field)
+                if val is None:
+                    continue
+                out.append({
+                    "week": r.get("week"), "opponent": r.get("opponent_team", "—"),
+                    "value": float(val), "season": r.get("season", fallback_season),
+                })
+            return out
+
+        out = _extract(rows, season) if rows else []
         out.sort(key=lambda x: (x["season"] or 0, x["week"] or 0), reverse=True)
+
+        # Sort key is (season, week), not week alone, so Week 18 of the
+        # prior season never outranks Week 1 of the current one. Every
+        # prior-season (season, week) tuple sorts strictly below every
+        # current-season one, so appending the prior season's own
+        # most-recent-first slice after the current season's rows keeps
+        # the combined list correctly ordered without a full re-sort.
+        if cross_season and n_games and len(out) < n_games:
+            _needed = n_games - len(out)
+            try:
+                prior_rows = _season_rows_for_player_by_name(season - 1, player_name)
+            except Exception:
+                prior_rows = []
+            prior_out = _extract(prior_rows, season - 1) if prior_rows else []
+            prior_out.sort(key=lambda x: (x["season"] or 0, x["week"] or 0), reverse=True)
+            out.extend(prior_out[:_needed])
+
         return out[:n_games] if n_games else out
     except Exception:
         return []

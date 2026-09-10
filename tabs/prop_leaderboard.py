@@ -362,26 +362,48 @@ def _render_prop_analysis(player: dict, ctx: dict, supabase, now_utc):
     st.caption("See how often this player has cleared the selected prop line.")
 
     _sample_n = {"Last 5 Games": 5, "Last 10 Games": 10, "Season": None}[_sub["sample_label"]]
-    # Reuse the game log already fetched above when the submitted Prop is
-    # still the currently-selected one (the common case); only re-fetch
-    # (still a cheap, cached call) if the user changed Prop after their
-    # last submission without resubmitting yet.
-    _sub_full_log = _full_log if _sub["stat_field"] == stat_field else get_player_game_log(
-        player["name"], player["team"], _sub["stat_field"], n_games=None,
-    )
-    _dashboard_log = _sub_full_log[:_sample_n] if _sample_n else _sub_full_log
+    if _sample_n is None:
+        # "Season" stays current-season only, matching its own label --
+        # reuse the game log already fetched above when the submitted
+        # Prop is still the currently-selected one (the common case);
+        # only re-fetch (still a cheap, cached call) if the user changed
+        # Prop after their last submission without resubmitting yet.
+        _dashboard_log = _full_log if _sub["stat_field"] == stat_field else get_player_game_log(
+            player["name"], player["team"], _sub["stat_field"], n_games=None,
+        )
+    else:
+        # "Last 5/10 Games": reaches into the prior season for enough of
+        # its most recent games to fill the requested sample when the
+        # current season alone doesn't have that many yet (e.g. only 2
+        # games played so far this season on a "Last 10 Games" request).
+        # Always fetched fresh rather than reusing _full_log, which is
+        # always current-season-only and feeds the Current-Season
+        # Average default above -- that must stay current-season only,
+        # distinct from this historical hit-rate sample. Both
+        # _weekly_rows_for_player and _season_rows_for_player_by_name are
+        # st.cache_data-cached, so a repeat call here on an unrelated
+        # rerun is a cache hit, not a new nflverse fetch.
+        _dashboard_log = get_player_game_log(
+            player["name"], player["team"], _sub["stat_field"],
+            n_games=_sample_n, cross_season=True,
+        )
 
     render_prop_hit_rate_dashboard(
         _sub["picked_label"], _sub["side"], _sub["threshold"], _dashboard_log, _sub["sample_label"],
         current_season=get_current_season(),
     )
 
-    if _sub_full_log:
+    if _dashboard_log:
         st.markdown("<div style='margin-top:14px'></div>", unsafe_allow_html=True)
         st.markdown("### Recent Prop Results")
+        # Iterates _dashboard_log (not a separately-unbounded log) so
+        # this table always shows exactly the games the Prop Hit Rate
+        # dashboard above just used -- for "Last 5/10 Games" that's the
+        # full (possibly cross-season) sample; for "Season" it's capped
+        # at 10 most recent, same as before this fix.
         _cur_season = get_current_season()
         _log_rows = []
-        for g in _sub_full_log[:10]:
+        for g in _dashboard_log[:10]:
             _wk = f"W{g['week']}" if g.get("season") == _cur_season else f"W{g['week']} {g.get('season')}"
             _log_rows.append({
                 # "Line" intentionally not repeated per row here — the
