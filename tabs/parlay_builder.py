@@ -59,46 +59,69 @@ def _prop_bet_label(leg) -> str:
     return f"{last_name} | {market} | {side_abbr}{line}".strip()
 
 
-def _representative_prop_line(player_market_rows: pd.DataFrame) -> pd.DataFrame:
+def _select_representative_line(candidate_rows: pd.DataFrame, tiebreak: str = "lower", group_key_fn=None) -> pd.DataFrame:
     """
-    Selects ONE exact line's rows (Over and/or Under, whichever already
-    exist) from an already-priced set of rows for one Player + Market,
-    per the approved representative-line rule:
+    Selects ONE exact line's rows from an already-priced set of candidate
+    rows that differ only by exact "Line" value (one Player+Market's rows
+    for Player Props; one game's Spread rows; one game's Total rows),
+    per the shared representative-line rule used across Player Props,
+    Spread, and Total:
       1. highest mi_num_books (most sportsbook coverage AT THAT EXACT
-         LINE -- mi_num_books is already computed per-line, unmodified,
-         by core/pipeline.py::build_market_intelligence),
+         LINE -- already computed per-line, unmodified, by
+         core/pipeline.py::build_market_intelligence),
       2. tie-broken by higher mi_num_anchors (more anchor-book
          agreement -- reuses the app's existing ANCHOR_BOOKS definition,
          not a new signal),
-      3. tie-broken by the lower line value, purely for deterministic,
-         reproducible output (no randomness, no preference claim).
+      3. final deterministic tie-break, controlled by `tiebreak`:
+         - "lower": the lower numeric line value (Total, Player Props).
+         - "abs": the smallest absolute line value (Spread). Spread
+           lines are signed toward a specific team, so "lower" would
+           silently bias the tie-break toward the favorite being a
+           bigger favorite; absolute value carries no such directional
+           bias.
 
-    This is a pure selection over rows core/nfl_prop_pipeline.py has
-    already devigged/consensus-priced -- it never averages,
-    interpolates, or normalizes across lines, and can never produce a
-    line value that wasn't already an existing priced row for this
-    player and market.
+    group_key_fn maps a row's own "Line" string to the value used to
+    group candidate lines together -- defaults to the raw string itself
+    (Total, Player Props, where every side of one threshold already
+    shares one identical Line string). Spread passes abs(float(line)):
+    core/pipeline.py::build_display_rows splits one underlying spread
+    threshold into a home row (e.g. "-3") and an away row (e.g. "+3")
+    with OPPOSITE-SIGNED Line strings for the SAME threshold -- without
+    this, home and away would be miscounted as two separate
+    representative-line candidates instead of the two sides of one.
+
+    Pure selection over rows already devigged/consensus-priced upstream
+    -- never averages, interpolates, or normalizes across lines, and can
+    never produce a line value that wasn't already an existing priced
+    row.
     """
-    def _line_sort_key(line_val):
-        _rows = player_market_rows[player_market_rows["Line"] == line_val]
-        _first = _rows.iloc[0]
+    if group_key_fn is None:
+        group_key_fn = lambda l: l
+
+    _rows = candidate_rows.dropna(subset=["Line"]).copy()
+    if _rows.empty:
+        return candidate_rows.iloc[0:0]
+    _rows["_group_key"] = _rows["Line"].apply(group_key_fn)
+
+    def _group_sort_key(group_key):
+        _grp = _rows[_rows["_group_key"] == group_key]
+        _first = _grp.iloc[0]
         _num_books = _first.get("mi_num_books")
         _num_anchors = _first.get("mi_num_anchors")
         try:
-            _line_num = float(line_val)
+            _line_num = float(_first["Line"])
         except (TypeError, ValueError):
             _line_num = float("inf")
+        _tiebreak_num = abs(_line_num) if tiebreak == "abs" else _line_num
         return (
             -(_num_books if pd.notna(_num_books) else -1),
             -(_num_anchors if pd.notna(_num_anchors) else -1),
-            _line_num,
+            _tiebreak_num,
         )
 
-    _distinct_lines = player_market_rows["Line"].dropna().unique()
-    if len(_distinct_lines) == 0:
-        return player_market_rows.iloc[0:0]
-    _best_line = min(_distinct_lines, key=_line_sort_key)
-    return player_market_rows[player_market_rows["Line"] == _best_line]
+    _distinct_groups = _rows["_group_key"].unique()
+    _best_group = min(_distinct_groups, key=_group_sort_key)
+    return _rows[_rows["_group_key"] == _best_group].drop(columns=["_group_key"])
 
 
 def _leg_short_label(leg) -> str:
@@ -489,6 +512,35 @@ def render(supabase, now_utc, eff_bankroll, eff_kelly, authed):
                                 (src["book"] == book) &
                                 ((src["home_team"] + " vs " + src["away_team"]) == leg["Game"])
                             ]
+                            # Exact-line fix: book+game alone isn't enough for
+                            # Spread/Total -- different books can carry
+                            # different thresholds for the same game (a book
+                            # at -2.5 must never be treated as carrying a
+                            # selected -3, same for a book at 47.5 vs a
+                            # selected 48). _markets_pb's raw per-book pivot
+                            # (build_books_df, unmodified) already carries the
+                            # exact numeric "line" (Spread, home-signed) /
+                            # "total" (Total) column needed to enforce this --
+                            # no new data, just the equality check that was
+                            # missing. Moneyline has no line concept and is
+                            # untouched. This mirrors the exact-line scoping
+                            # the prop branch above already had via
+                            # mi_book_table.
+                            if leg["Market"] == "Spread" and not s.empty:
+                                _home_team_name, _, _ = leg["Game"].partition(" vs ")
+                                try:
+                                    _expected_line = (
+                                        float(leg["Line"]) if leg["Pick"] == _home_team_name
+                                        else -float(leg["Line"])
+                                    )
+                                    s = s[s["line"] == _expected_line]
+                                except (TypeError, ValueError):
+                                    s = s.iloc[0:0]
+                            elif leg["Market"] == "Total" and not s.empty:
+                                try:
+                                    s = s[s["total"] == float(leg["Line"])]
+                                except (TypeError, ValueError):
+                                    s = s.iloc[0:0]
                             if s.empty:
                                 valid = False; break
                             row = s.iloc[0]
@@ -646,7 +698,7 @@ def render(supabase, now_utc, eff_bankroll, eff_kelly, authed):
                             # same market.
                             for _prop_mkt in sorted(_player_prop_rows["Market"].dropna().unique()):
                                 _mkt_prop_rows = _player_prop_rows[_player_prop_rows["Market"] == _prop_mkt]
-                                _rep_rows = _representative_prop_line(_mkt_prop_rows)
+                                _rep_rows = _select_representative_line(_mkt_prop_rows, tiebreak="lower")
                                 if _rep_rows.empty:
                                     continue
                                 _over_rows = _rep_rows[_rep_rows["Side"] == "Over"]
@@ -708,6 +760,27 @@ def render(supabase, now_utc, eff_bankroll, eff_kelly, authed):
                             _mkt_rows = _game_rows[_game_rows["Market"] == _mkt_name]
                             if _mkt_rows.empty:
                                 continue
+
+                            # Spread/Total: narrow every distinct exact line down to
+                            # one representative line, same rule and same helper as
+                            # Player Props -- Moneyline has no line concept and is
+                            # left completely untouched. Spread groups by absolute
+                            # value (see _select_representative_line's docstring --
+                            # a single threshold splits into a "-3" home row and a
+                            # "+3" away row, which must be treated as one candidate,
+                            # not two). Total groups by its own Line string directly,
+                            # same as Player Props, since Over/Under already share
+                            # one identical Line string per threshold.
+                            if _mkt_name == "Spread":
+                                _mkt_rows = _select_representative_line(
+                                    _mkt_rows, tiebreak="abs",
+                                    group_key_fn=lambda l: abs(float(l)),
+                                )
+                            elif _mkt_name == "Total":
+                                _mkt_rows = _select_representative_line(_mkt_rows, tiebreak="lower")
+                            if _mkt_rows.empty:
+                                continue
+
                             _lock_key = (_game_label, _commence_iso, _mkt_name)
                             _locked_leg = _locked_markets.get(_lock_key)
 
@@ -718,6 +791,10 @@ def render(supabase, now_utc, eff_bankroll, eff_kelly, authed):
                             # repeated captions for the same information. Row text
                             # (e.g. "Lions -2 (-109)") matches the same concise
                             # "side (odds)" format used everywhere in this card.
+                            # Spread/Total now show no odds at all -- the user is
+                            # only deciding a side on the representative line here;
+                            # pricing returns at Compare Parlay Odds, same as
+                            # Player Props.
                             for _, _r in _mkt_rows.iterrows():
                                 _pick_label = _r.get("Pick", "—")
                                 _row_line = _r.get("Line")
@@ -731,19 +808,25 @@ def render(supabase, now_utc, eff_bankroll, eff_kelly, authed):
                                     and _locked_leg["Pick"] == _pick_label
                                     and _locked_leg["Line"] == _leg_line
                                 )
-                                _best_odds = _r.get("Best Odds")
-                                _odds_str = (
-                                    _fmt_odds_in_format(int(_best_odds), _odds_format)
-                                    if pd.notna(_best_odds) else "—"
-                                )
-                                if _mkt_name == "Total":
-                                    _row_core = f"{_pick_label} {_row_line}" if pd.notna(_row_line) else _pick_label
-                                elif _mkt_name == "Spread" and pd.notna(_row_line):
-                                    _row_core = f"{_short_team(_pick_label)} {_row_line}"
-                                else:
+                                if _mkt_name == "Moneyline":
+                                    _best_odds = _r.get("Best Odds")
+                                    _odds_str = (
+                                        _fmt_odds_in_format(int(_best_odds), _odds_format)
+                                        if pd.notna(_best_odds) else "—"
+                                    )
                                     _row_core = _short_team(_pick_label)
+                                    _row_text = f"{_row_core} ({_odds_str})"
+                                elif _mkt_name == "Total":
+                                    _row_core = f"{_pick_label} {_row_line}" if pd.notna(_row_line) else _pick_label
+                                    _row_text = _row_core
+                                else:
+                                    _row_core = (
+                                        f"{_short_team(_pick_label)} {_row_line}"
+                                        if pd.notna(_row_line) else _short_team(_pick_label)
+                                    )
+                                    _row_text = _row_core
                                 _rc1, _rc2 = st.columns([5, 2])
-                                _rc1.write(f"{_row_core} ({_odds_str})")
+                                _rc1.write(_row_text)
                                 _btn_key = f"pb_add_{_game_label}_{_commence_iso}_{_mkt_name}_{_pick_label}_{_row_line}"
                                 if _is_this_leg_added:
                                     if _rc2.button("Remove", key=_btn_key, use_container_width=True):
