@@ -44,18 +44,61 @@ def _short_team(team_name) -> str:
 
 
 def _prop_bet_label(leg) -> str:
-    """Compact prop leg label, e.g. 'Jefferson Receiving Yards O79.5' --
-    short player surname + market + Over/Under-abbreviated line, matching
-    the existing short-label convention (_short_team's surname-only style)
-    already used for game-market legs. Used both as the "Bet" label in
-    Current Parlay and as the Remove-selectbox entry for prop legs."""
+    """Compact pipe-separated prop leg label, e.g.
+    'McCaffrey | Rushing Yards | O60.5' -- short player surname (matching
+    the existing short-label convention already used for game-market
+    legs), full market name (no new abbreviation table), Over/Under-
+    abbreviated line. Used both as the "Bet" label in Current Parlay and
+    as the Remove-selectbox entry for prop legs."""
     player = leg.get("Player", "")
     last_name = player.split()[-1] if player else "—"
     market = leg.get("Market", "")
     side = leg.get("Side", "")
     line = leg.get("Line", "")
     side_abbr = "O" if side == "Over" else "U" if side == "Under" else side
-    return f"{last_name} {market} {side_abbr}{line}".strip()
+    return f"{last_name} | {market} | {side_abbr}{line}".strip()
+
+
+def _representative_prop_line(player_market_rows: pd.DataFrame) -> pd.DataFrame:
+    """
+    Selects ONE exact line's rows (Over and/or Under, whichever already
+    exist) from an already-priced set of rows for one Player + Market,
+    per the approved representative-line rule:
+      1. highest mi_num_books (most sportsbook coverage AT THAT EXACT
+         LINE -- mi_num_books is already computed per-line, unmodified,
+         by core/pipeline.py::build_market_intelligence),
+      2. tie-broken by higher mi_num_anchors (more anchor-book
+         agreement -- reuses the app's existing ANCHOR_BOOKS definition,
+         not a new signal),
+      3. tie-broken by the lower line value, purely for deterministic,
+         reproducible output (no randomness, no preference claim).
+
+    This is a pure selection over rows core/nfl_prop_pipeline.py has
+    already devigged/consensus-priced -- it never averages,
+    interpolates, or normalizes across lines, and can never produce a
+    line value that wasn't already an existing priced row for this
+    player and market.
+    """
+    def _line_sort_key(line_val):
+        _rows = player_market_rows[player_market_rows["Line"] == line_val]
+        _first = _rows.iloc[0]
+        _num_books = _first.get("mi_num_books")
+        _num_anchors = _first.get("mi_num_anchors")
+        try:
+            _line_num = float(line_val)
+        except (TypeError, ValueError):
+            _line_num = float("inf")
+        return (
+            -(_num_books if pd.notna(_num_books) else -1),
+            -(_num_anchors if pd.notna(_num_anchors) else -1),
+            _line_num,
+        )
+
+    _distinct_lines = player_market_rows["Line"].dropna().unique()
+    if len(_distinct_lines) == 0:
+        return player_market_rows.iloc[0:0]
+    _best_line = min(_distinct_lines, key=_line_sort_key)
+    return player_market_rows[player_market_rows["Line"] == _best_line]
 
 
 def _leg_short_label(leg) -> str:
@@ -596,65 +639,69 @@ def render(supabase, now_utc, eff_bankroll, eff_kelly, authed):
                             # Only that player's markets with an actual
                             # FVB-priced row appear -- never the full
                             # Phase-1 market list regardless of coverage.
+                            # One row per market: the user is only ever
+                            # deciding Over or Under on a single
+                            # representative line, never choosing between
+                            # several sportsbook-specific versions of the
+                            # same market.
                             for _prop_mkt in sorted(_player_prop_rows["Market"].dropna().unique()):
                                 _mkt_prop_rows = _player_prop_rows[_player_prop_rows["Market"] == _prop_mkt]
-                                st.caption(_prop_mkt)
-                                for _, _pr in _mkt_prop_rows.iterrows():
-                                    _prop_leg = {
-                                        "Type": "prop", "Market": _pr["Market"], "Game": _pr["Game"],
-                                        "Pick": _pr["Pick"], "Line": _pr["Line"],
-                                        "Player": _pr["Player"], "Side": _pr["Side"],
+                                _rep_rows = _representative_prop_line(_mkt_prop_rows)
+                                if _rep_rows.empty:
+                                    continue
+                                _over_rows = _rep_rows[_rep_rows["Side"] == "Over"]
+                                _under_rows = _rep_rows[_rep_rows["Side"] == "Under"]
+                                _over_row = _over_rows.iloc[0] if not _over_rows.empty else None
+                                _under_row = _under_rows.iloc[0] if not _under_rows.empty else None
+                                if _over_row is None and _under_row is None:
+                                    continue
+
+                                st.markdown(f"**{_picked_player} | {_prop_mkt}**")
+
+                                # Only one side of one market can be
+                                # selected at a time -- same "one pick per
+                                # market, per game" rule Game Markets
+                                # already enforces (Over/Under of the same
+                                # prop are mutually exclusive real-world
+                                # bets, exactly like Home/Away Moneyline).
+                                _added_leg_for_mkt = next(
+                                    (l for l in st.session_state.pb_parlay_legs
+                                     if l.get("Type") == "prop" and l.get("_commence") == _commence_iso
+                                     and l.get("Market") == _prop_mkt and l.get("Player") == _picked_player),
+                                    None,
+                                )
+                                _added_side = _added_leg_for_mkt.get("Side") if _added_leg_for_mkt else None
+
+                                _oc, _uc = st.columns(2)
+                                for _col, _side_row, _side_name in [(_oc, _over_row, "Over"), (_uc, _under_row, "Under")]:
+                                    if _side_row is None:
+                                        continue
+                                    _side_label = f"{_side_name} {_side_row['Line']}"
+                                    _side_leg = {
+                                        "Type": "prop", "Market": _prop_mkt, "Game": _side_row["Game"],
+                                        "Pick": _side_row["Pick"], "Line": _side_row["Line"],
+                                        "Player": _side_row["Player"], "Side": _side_name,
                                         "_commence": _commence_iso,
                                     }
-                                    _is_this_prop_added = any(
-                                        l.get("Type") == "prop"
-                                        and l.get("_commence") == _commence_iso
-                                        and l.get("Market") == _pr["Market"]
-                                        and l.get("Pick") == _pr["Pick"]
-                                        and l.get("Line") == _pr["Line"]
-                                        for l in st.session_state.pb_parlay_legs
-                                    )
-                                    # Best Odds/EV% shown here are read
-                                    # directly from the already-priced FVM
-                                    # prop row -- never recalculated here.
-                                    _odds_str = _fmt_odds_in_format(
-                                        int(_pr["Best Odds"]) if pd.notna(_pr.get("Best Odds")) else None,
-                                        _odds_format,
-                                    ) if pd.notna(_pr.get("Best Odds")) else "—"
-                                    _ev_str = _pr.get("EV%", "—")
-                                    _row_label = f"**{_prop_bet_label(_prop_leg)}**  \nBest Odds {_odds_str} · EV {_ev_str}"
-                                    _fair_odds_raw = (
-                                        _pr.get("mi_fair_odds_a") if _pr["Side"] == "Over" else _pr.get("mi_fair_odds_b")
-                                    )
-                                    _fair_odds_str = (
-                                        _fmt_odds_in_format(int(_fair_odds_raw), _odds_format)
-                                        if pd.notna(_fair_odds_raw) else "—"
-                                    )
-                                    _best_book_str = _pr.get("Best Book") or "—"
-                                    _help_text = f"Fair Odds {_fair_odds_str} · Best Book {_best_book_str}"
-
-                                    _rc1, _rc2 = st.columns([5, 2])
-                                    _rc1.markdown(_row_label, help=_help_text)
-                                    _btn_key = (
-                                        f"pb_add_prop_{_game_label}_{_commence_iso}_"
-                                        f"{_pr['Market']}_{_pr['Pick']}_{_pr['Line']}"
-                                    )
-                                    if _is_this_prop_added:
-                                        if _rc2.button("Remove", key=_btn_key, use_container_width=True):
+                                    _btn_key = f"pb_add_prop_{_game_label}_{_commence_iso}_{_prop_mkt}_{_picked_player}_{_side_name}"
+                                    if _added_side == _side_name:
+                                        if _col.button(f"✓ {_side_label}", key=_btn_key,
+                                                        use_container_width=True, type="primary"):
                                             st.session_state.pb_parlay_legs = [
                                                 l for l in st.session_state.pb_parlay_legs
                                                 if not (
-                                                    l.get("Type") == "prop"
-                                                    and l.get("_commence") == _commence_iso
-                                                    and l.get("Market") == _pr["Market"]
-                                                    and l.get("Pick") == _pr["Pick"]
-                                                    and l.get("Line") == _pr["Line"]
+                                                    l.get("Type") == "prop" and l.get("_commence") == _commence_iso
+                                                    and l.get("Market") == _prop_mkt
+                                                    and l.get("Player") == _picked_player
+                                                    and l.get("Side") == _side_name
                                                 )
                                             ]
                                             _fragment_rerun()
+                                    elif _added_side is not None:
+                                        _col.button(_side_label, key=_btn_key, disabled=True, use_container_width=True)
                                     else:
-                                        if _rc2.button("Add", key=_btn_key, use_container_width=True):
-                                            st.session_state.pb_parlay_legs.append(_prop_leg)
+                                        if _col.button(_side_label, key=_btn_key, use_container_width=True):
+                                            st.session_state.pb_parlay_legs.append(_side_leg)
                                             _fragment_rerun()
                     else:
                         for _mkt_name in ["Moneyline", "Spread", "Total"]:
