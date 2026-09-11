@@ -850,7 +850,30 @@ def render(supabase, now_utc, eff_bankroll, eff_kelly, authed):
                                     continue
                                 _any_market_rendered = True
 
-                                st.markdown(f"**{_prop_mkt_label}**")
+                                # Informational only -- the mean of every
+                                # available sportsbook's own line for this
+                                # game/player/market (one observation per
+                                # book, from the same raw per-book pivot
+                                # driving eligibility above; a book that
+                                # changed its line intraday still
+                                # contributes its "first row wins" line,
+                                # matching the convention already used
+                                # elsewhere for this same pivot). Never
+                                # stored on the leg, never used to gate
+                                # sportsbook eligibility or to look up a
+                                # fair probability -- Compare Parlay Odds
+                                # continues to resolve each book's own
+                                # actual line/price exactly as before.
+                                _avg_line_vals = _player_rows["line"].dropna()
+                                _avg_line = (
+                                    sum(float(v) for v in _avg_line_vals) / len(_avg_line_vals)
+                                    if len(_avg_line_vals) else None
+                                )
+                                _mkt_header = (
+                                    f"**{_prop_mkt_label}** · Avg Line {_avg_line:g}"
+                                    if _avg_line is not None else f"**{_prop_mkt_label}**"
+                                )
+                                st.markdown(_mkt_header)
 
                                 # Only one side of one market can be
                                 # selected at a time -- same "one pick per
