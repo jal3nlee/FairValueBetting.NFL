@@ -275,9 +275,29 @@ st.set_page_config(
 )
 SIDEBAR_W = 320
 DEBUG_MODE = False
+# The base URL of the standalone, cross-sport FVB-Platform product suite
+# (Sportsbook Screener / Prop Leaderboard) this NFL app's "FVB Products"
+# sidebar section links out to -- same overridable-env-var-with-a-live-
+# default convention already used for SUPABASE_URL etc. above, and the
+# same one FVB-Platform's own nav.py uses for its sibling links
+# (FVB_MARKETING_URL / FVB_NFL_URL / ...).
+FVB_PLATFORM_URL = os.getenv("FVB_PLATFORM_URL", "https://fairvaluebetting.com")
 # =======================
 # SIDEBAR UI
 # =======================
+# Reorganized into the same section pattern as the newer standalone FVB-
+# Platform sidebar (nav.py there): a bold section label, a divider after
+# each group, external destinations as plain markdown links. Every piece
+# of existing functionality below (auth forms, Resources content, sign-
+# out logic, feedback submission) is unchanged -- only grouped under
+# clearer headings. "NFL" here is an orientation list, not clickable
+# navigation: this app selects tabs via st.tabs() in the main area, which
+# Streamlit provides no way to drive from the sidebar (no key/selection
+# API), so making these entries look clickable would be misleading. FVB
+# Products only links to Sportsbook Screener and Prop Leaderboard --
+# FVB-Platform's own Parlay Builder page doesn't exist yet (see its
+# nav.py: "Parlay Builder -- coming soon"), so this mirrors that same
+# non-link treatment rather than pointing at a page that isn't there.
 with st.sidebar:
     if LOGO_PATH:
         st.image(str(LOGO_PATH), width=SIDEBAR_W)
@@ -288,7 +308,9 @@ with st.sidebar:
         "⚾ [MLB](https://mlb.fairvaluebetting.com)  ·  "
         "🏈 [NCAAF](https://ncaaf.fairvaluebetting.com)"
     )
-    st.sidebar.divider()
+    st.divider()
+
+    st.markdown("**Account**")
     if authed:
         # authed already means a session was successfully attached to this
         # rerun's client above -- this is defense-in-depth against a
@@ -363,6 +385,40 @@ with st.sidebar:
                         st.success("Account created! Check your email to verify, then sign in.")
                     except Exception as e:
                         st.error(f"Sign-up failed: {str(e) or 'Try again.'}")
+
+    st.divider()
+
+    # Orientation only, not clickable navigation -- this app switches
+    # sections via st.tabs() in the main area below, and Streamlit's
+    # st.tabs() has no key/selection API a sidebar control could drive.
+    # Listing the destinations here still gives users a map of the
+    # workspace without implying a link that wouldn't actually work.
+    st.markdown("**NFL**")
+    st.caption("This workspace's tabs, for quick orientation.")
+    st.markdown(
+        "- Fair Value Model\n"
+        "- Matchup Center\n"
+        "- Fantasy Tools\n"
+        "- Prop Research\n"
+        "- Sportsbook Screener\n"
+        "- Parlay Builder\n"
+        "- Arbitrage Tracker"
+    )
+
+    st.divider()
+
+    # Standalone, cross-sport FVB-Platform products -- separate deployed
+    # app, separate URL. Only Sportsbook Screener and Prop Leaderboard are
+    # live there today; Parlay Builder is shown the same non-link "coming
+    # soon" way FVB-Platform's own sidebar shows it, not as a dead link.
+    st.markdown("**FVB Products**")
+    st.caption("Standalone cross-sport tools.")
+    st.markdown(f"[📊 Sportsbook Screener ↗]({FVB_PLATFORM_URL}/screener)")
+    st.markdown(f"[🎯 Prop Leaderboard ↗]({FVB_PLATFORM_URL}/props)")
+    st.caption("🔒 Parlay Builder — coming soon")
+
+    st.divider()
+    st.markdown("**Resources**")
 with st.sidebar.expander("How to use", expanded=False):
     st.markdown(
         """
