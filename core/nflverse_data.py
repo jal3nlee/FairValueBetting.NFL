@@ -1,6 +1,8 @@
 # core/nflverse_data.py
 import streamlit as st
 
+from core.data_sources import infer_current_week_index
+
 try:
     import nflreadpy as nfl
     _NFLVERSE_AVAILABLE = True
@@ -126,7 +128,11 @@ PROP_AVG_LABEL = {
     "Receptions":       "Avg Rec",
     "Targets":          "Avg Targets",
 }
-SAMPLE_OPTIONS = {"Last 3 Games": 3, "Last 5 Games": 5, "Last 10 Games": 10, "Season": None}
+# Prop Leaderboard sample-size options only (core/nflverse_data.py::
+# build_prop_leaderboard / tabs/prop_leaderboard.py::render_leaderboard_view).
+# Not used by Player Research's own separate Sample Size control (that
+# one still offers Last 10 Games, unaffected by this).
+SAMPLE_OPTIONS = {"Last 3 Games": 3, "Last 5 Games": 5, "Season": None}
 _SEASON_MIN_GAMES = 3
 
 PLAYER_SEARCH_EXTRA_STATS = {"Anytime TD": "_any_td"}
@@ -376,6 +382,63 @@ def get_nfl_team_names() -> list[tuple[str, str]]:
         for r in rows if r.get("team_name") and r.get("team_abbr")
     }
     return sorted(pairs)
+
+
+@st.cache_data(ttl=6 * 3600, show_spinner=False)
+def _current_week_teams_for_season(season: int, week_index: int) -> set:
+    """Team abbreviations with a game anywhere in the given NFL week
+    (Thu-Wed) per nflreadpy's own schedule -- includes BOTH completed
+    and upcoming games in that week (a team that already played earlier
+    in the week is still included; this never narrows to "today" or
+    "still upcoming"). Bye teams simply have no row for that week and are
+    naturally excluded. week_index is the same value infer_current_week_
+    index (core/data_sources.py) already returns for every other
+    current-week view in this app -- not a second NFL calendar."""
+    schedules = _load_schedules(season)
+    if schedules is None:
+        return set()
+    try:
+        wk = schedules.filter(schedules["week"] == week_index)
+        if "game_type" in wk.columns:
+            wk = wk.filter(wk["game_type"] == "REG")
+        rows = wk.to_dicts()
+    except Exception:
+        return set()
+    teams = set()
+    for r in rows:
+        if r.get("home_team"):
+            teams.add(r["home_team"])
+        if r.get("away_team"):
+            teams.add(r["away_team"])
+    return teams
+
+
+def get_current_week_teams(now_utc) -> set:
+    """Public entry point: resolves season/week from now_utc via the same
+    infer_current_week_index used everywhere else in the app, then
+    delegates to the cached per-(season, week_index) lookup above."""
+    season = get_current_season()
+    if season is None:
+        return set()
+    week_index = infer_current_week_index(now_utc)
+    return _current_week_teams_for_season(season, week_index)
+
+
+def get_current_week_team_names(now_utc) -> list[tuple[str, str]]:
+    """(full_name, abbr) pairs restricted to only the teams with a game
+    anywhere in the current NFL week. The Team filter dropdown
+    (tabs/prop_leaderboard.py) and Prop Leaderboard candidate eligibility
+    (_cached_build_prop_leaderboard below) both derive from this exact
+    same get_current_week_teams set, so they can never disagree -- a bye
+    team is never offered as a filter option that could only return zero
+    results. Fails open to the full team list if the current-week team
+    set can't be resolved (e.g. a transient schedules fetch failure),
+    rather than emptying the Team filter entirely."""
+    current_teams = get_current_week_teams(now_utc)
+    all_pairs = get_nfl_team_names()
+    if not current_teams:
+        return all_pairs
+    return [(name, abbr) for name, abbr in all_pairs if abbr in current_teams]
 
 
 def get_player_usage(player_name: str, team_full_name: str, position: str, prior_team_full_name: str | None = None) -> dict:
@@ -699,7 +762,9 @@ def _all_player_weekly_rows(season: int) -> list[dict]:
         return []
 
 
-def build_prop_leaderboard(stat_label: str, side: str, line: float, sample_label: str, limit: int | None = 10) -> list[dict]:
+def build_prop_leaderboard(
+    stat_label: str, side: str, line: float, sample_label: str, now_utc, limit: int | None = 10,
+) -> list[dict]:
     """
     Returns up to `limit` results (10 by default, matching prior behavior
     exactly); pass limit=None for the full sorted candidate list, e.g. so
@@ -708,6 +773,12 @@ def build_prop_leaderboard(stat_label: str, side: str, line: float, sample_label
     getting sparse or misleading results. Candidate construction,
     eligibility, hit-rate calculation, and ranking are unchanged — this
     only makes the final truncation step optional.
+
+    now_utc resolves only the current NFL week (via the same
+    infer_current_week_index used everywhere else in the app) for
+    current-week candidate eligibility — see _cached_build_prop_leaderboard.
+    It plays no role in which historical games make up a player's rolling
+    sample; that's governed entirely by sample_label/n_games.
 
     This outer wrapper stays uncached and resolves the season first,
     exactly like get_current_season()'s own callers elsewhere in this
@@ -719,14 +790,17 @@ def build_prop_leaderboard(stat_label: str, side: str, line: float, sample_label
     season = get_current_season()
     if season is None:
         return []
+    week_index = infer_current_week_index(now_utc)
     try:
-        return _cached_build_prop_leaderboard(season, stat_label, side, line, sample_label, limit)
+        return _cached_build_prop_leaderboard(season, stat_label, side, line, sample_label, week_index, limit)
     except Exception:
         return []
 
 
 @st.cache_data(ttl=6 * 3600, show_spinner=False)
-def _cached_build_prop_leaderboard(season: int, stat_label: str, side: str, line: float, sample_label: str, limit: int | None) -> list[dict]:
+def _cached_build_prop_leaderboard(
+    season: int, stat_label: str, side: str, line: float, sample_label: str, week_index: int, limit: int | None,
+) -> list[dict]:
     """
     Scans every player-week row for the whole league (_all_player_weekly_rows,
     itself cached and failure-isolated) and was being redone from scratch
@@ -735,9 +809,52 @@ def _cached_build_prop_leaderboard(season: int, stat_label: str, side: str, line
     its own inputs only change when the user actually edits a filter and
     submits. TTL matches _all_player_weekly_rows' own 6h TTL, so this
     adds no staleness beyond what's already accepted for the underlying
-    data. season is passed in already-resolved by build_prop_leaderboard
-    above rather than re-derived here, so a season-lookup failure can
-    never be masked by this function's own cache.
+    data. season/week_index are passed in already-resolved by
+    build_prop_leaderboard above rather than re-derived here, so a
+    season/week lookup failure can never be masked by this function's
+    own cache.
+
+    "Season" (n_games is None) is current-season only, unchanged from
+    before — _SEASON_MIN_GAMES eligibility, no prior-season data touched
+    or fetched at all.
+
+    "Last 3 Games" / "Last 5 Games" are rolling samples that may reach
+    into the prior season, mirroring get_player_game_log's own
+    cross-season behavior (Player Research's own sample-size control),
+    applied here to the league-wide scan instead of one player at a
+    time: a player with fewer than n_games games so far this season is
+    topped up with their most recent prior-season games rather than
+    being excluded outright. As the current season accumulates games,
+    prior-season games naturally stop being needed and drop out on
+    their own — nothing here special-cases that, it falls out of always
+    taking the N most recent games by (season, week) once enough
+    current-season games exist.
+
+    Grouped by normalized player NAME ONLY (not name+team), via the same
+    _norm_name already used elsewhere in this module to match a player
+    across a team change — grouping by (name, team) would silently
+    fragment a traded player's history into two separate, incomplete
+    entries instead of merging it. The displayed "team" is whichever
+    team the player's own most recent qualifying game was played for —
+    never a stale/prior team once current games exist — and that same
+    most-recent team is also what current-week eligibility (below) is
+    checked against.
+
+    Players with zero current-season games in an eligible position are
+    not considered at all, even if prior-season data alone could fill a
+    sample — this keeps the leaderboard scoped to players with some
+    current-season presence.
+
+    Current-week eligibility (new): a candidate's CURRENT/latest team
+    (the same most-recent-game team used for display) must have a game
+    anywhere in the current NFL week (get_current_week_teams /
+    _current_week_teams_for_season) — completed or upcoming, so a team
+    that already played earlier in the week stays eligible through the
+    rest of it, and a bye team is excluded. This is entirely separate
+    from, and never filters, the historical sample itself: which games
+    count toward Last 3/Last 5/Season is unaffected by this check. Fails
+    open (no filtering at all) if the current-week team set can't be
+    resolved, rather than silently emptying the whole leaderboard.
     """
     field = PROP_STAT_MAP.get(stat_label)
     eligible_positions = PROP_POSITION_MAP.get(stat_label, [])
@@ -745,25 +862,56 @@ def _cached_build_prop_leaderboard(season: int, stat_label: str, side: str, line
     if not field or not eligible_positions:
         return []
 
-    rows = _all_player_weekly_rows(season)
-    if not rows:
+    current_rows = _all_player_weekly_rows(season)
+    if not current_rows:
         return []
 
-    by_player: dict[tuple, list[dict]] = {}
-    positions_by_player: dict[tuple, str] = {}
-    for r in rows:
+    by_player: dict[str, list[dict]] = {}
+    for r in current_rows:
         if r.get("position") not in eligible_positions:
             continue
         val = r.get(field)
         if val is None:
             continue
-        key = (r.get("player_display_name") or r.get("player_name"), r.get("team"))
-        by_player.setdefault(key, []).append({"week": r.get("week"), "value": float(val)})
-        positions_by_player[key] = r.get("position")
+        raw_name = r.get("player_display_name") or r.get("player_name")
+        key = _norm_name(raw_name)
+        by_player.setdefault(key, []).append({
+            "week": r.get("week"), "season": season, "value": float(val),
+            "team": r.get("team"), "player": raw_name, "position": r.get("position"),
+        })
+
+    if n_games is not None:
+        # Only fetch the prior season at all if at least one candidate
+        # actually needs it — once far enough into a season that
+        # everyone already has a full current-season sample, this never
+        # touches season - 1.
+        needs_prior = {k for k, games in by_player.items() if len(games) < n_games}
+        if needs_prior:
+            try:
+                prior_rows = _all_player_weekly_rows(season - 1)
+            except Exception:
+                prior_rows = []
+            for r in prior_rows:
+                val = r.get(field)
+                if val is None:
+                    continue
+                raw_name = r.get("player_display_name") or r.get("player_name")
+                key = _norm_name(raw_name)
+                if key not in needs_prior:
+                    continue  # only backfill players already seen this season
+                by_player[key].append({
+                    "week": r.get("week"), "season": season - 1, "value": float(val),
+                    "team": r.get("team"), "player": raw_name, "position": r.get("position"),
+                })
+
+    current_week_teams = _current_week_teams_for_season(season, week_index)
 
     results = []
-    for (name, team), games in by_player.items():
-        games.sort(key=lambda g: g["week"] or 0, reverse=True)
+    for key, games in by_player.items():
+        # Chronological ordering by (season, week) — never raw API row
+        # order — so "most recent N" is unambiguous and current-season
+        # games always outrank prior-season ones regardless of week number.
+        games.sort(key=lambda g: (g["season"], g["week"] or 0), reverse=True)
 
         if n_games is not None:
             if len(games) < n_games:
@@ -778,8 +926,12 @@ def _cached_build_prop_leaderboard(season: int, stat_label: str, side: str, line
         if not hr:
             continue
 
+        most_recent = sample[0]
+        if current_week_teams and most_recent["team"] not in current_week_teams:
+            continue
+
         results.append({
-            "player": name, "team": team, "position": positions_by_player.get((name, team), ""),
+            "player": most_recent["player"], "team": most_recent["team"], "position": most_recent["position"],
             "hits": hr["hits"], "games": hr["total"], "pushes": hr["pushes"],
             "hit_rate": hr["hits"] / hr["total"] * 100,
             "avg": round(sum(g["value"] for g in sample) / len(sample), 1),

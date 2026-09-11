@@ -13,7 +13,8 @@ from core.nflverse_data import (
     PLAYER_SEARCH_EXTRA_STATS, PROP_LABEL_TO_ODDS_MARKET,
     build_prop_leaderboard, get_player_game_log, get_current_season,
     get_usage_samples, get_expanded_season_stats, get_recent_games,
-    get_nfl_team_names, LINEUP_USAGE_METRICS, METRIC_LABELS, PERCENT_METRICS,
+    get_current_week_team_names,
+    LINEUP_USAGE_METRICS, METRIC_LABELS, PERCENT_METRICS,
 )
 from core.lineup_data import (
     get_team_game_context, fetch_player_props_for_event, get_consensus_prop_line,
@@ -76,7 +77,11 @@ def render_leaderboard_view(supabase, now_utc):
     silently recomputes them — previous results stay visible, captioned
     with exactly what they're showing, until the next submit.
     """
-    _team_pairs = get_nfl_team_names()  # cached nflreadpy team table, no new fetch
+    # Only teams with a game anywhere in the current NFL week -- the same
+    # set candidate eligibility below is checked against (get_current_
+    # week_team_names / get_current_week_teams), so the Team filter can
+    # never offer a bye team that could only ever return zero results.
+    _team_pairs = get_current_week_team_names(now_utc)
     _team_options = ["All Teams"] + [name for name, _abbr in _team_pairs]
 
     with st.form(key="pl_form"):
@@ -124,7 +129,7 @@ def render_leaderboard_view(supabase, now_utc):
         # eligibility, hit-rate calculation, and ranking are all unchanged
         # inside build_prop_leaderboard; only truncation moved here.
         all_results = build_prop_leaderboard(
-            _sub["stat_label"], _sub["side"], _sub["line"], _sub["sample_label"], limit=None,
+            _sub["stat_label"], _sub["side"], _sub["line"], _sub["sample_label"], now_utc, limit=None,
         )
 
     if not all_results:
