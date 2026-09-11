@@ -1,6 +1,8 @@
 # tabs/prop_leaderboard.py
 # User-facing name: "Prop Research" — module filename kept as-is to
 # avoid unnecessary import-risk across the app.
+import html
+
 import streamlit as st
 import pandas as pd
 
@@ -13,13 +15,28 @@ from core.nflverse_data import (
     PLAYER_SEARCH_EXTRA_STATS, PROP_LABEL_TO_ODDS_MARKET,
     build_prop_leaderboard, get_player_game_log, get_current_season,
     get_usage_samples, get_expanded_season_stats, get_recent_games,
-    get_current_week_team_names,
+    get_current_week_team_names, format_prop_line_value,
     LINEUP_USAGE_METRICS, METRIC_LABELS, PERCENT_METRICS,
 )
 from core.lineup_data import (
     get_team_game_context, fetch_player_props_for_event, get_consensus_prop_line,
 )
 from core.nfl_prop_market_config import normalize_player_key
+
+# Prop Leaderboard player-card styling -- ported from FVB-Platform's
+# core/branding.py brand colors (core/stat_leaderboard.py's card CSS
+# reuses these same two hex values), matching "FVB styling conventions"
+# rather than this app's own theme primary (#4A79BD). This app has no
+# core/branding.py module, so the two constants are defined locally
+# instead of imported, same as the local NFL_TEAM_ABBR/_logo_url copy
+# below (an already-established duplication pattern in this codebase --
+# see tabs/matchup_center.py, tabs/parlay_builder.py,
+# tabs/sportsbook_screener.py, tabs/market_movers.py).
+_LB_NAVY = "#2B337C"
+_LB_BLUE = "#4978BC"
+_LB_GAME_LOG_ROW_HEIGHT = 35  # approximate st.dataframe row height, px
+_LB_GAME_LOG_HEADER_HEIGHT = 38
+_LB_GAME_LOG_MAX_HEIGHT = 280  # bounded/scrollable cap for long Season samples
 
 # Position-aware default Prop selection -- WR/TE default to Receiving
 # Yards even though PROP_POSITION_MAP's dict order would otherwise land
@@ -62,6 +79,262 @@ def _fmt_usage_val(v, is_pct):
     if v is None:
         return "—"
     return f"{v * 100:.0f}%" if is_pct else f"{v:.1f}"
+
+
+# Same team-abbreviation map and ESPN CDN logo URL pattern already
+# duplicated per-tab elsewhere in this app (matchup_center.py,
+# parlay_builder.py, sportsbook_screener.py, market_movers.py) -- used
+# here only as a card-headshot fallback when a player has no headshot_url.
+NFL_TEAM_ABBR = {
+    "Arizona Cardinals": "ari", "Atlanta Falcons": "atl", "Baltimore Ravens": "bal",
+    "Buffalo Bills": "buf", "Carolina Panthers": "car", "Chicago Bears": "chi",
+    "Cincinnati Bengals": "cin", "Cleveland Browns": "cle", "Dallas Cowboys": "dal",
+    "Denver Broncos": "den", "Detroit Lions": "det", "Green Bay Packers": "gb",
+    "Houston Texans": "hou", "Indianapolis Colts": "ind", "Jacksonville Jaguars": "jax",
+    "Kansas City Chiefs": "kc", "Las Vegas Raiders": "lv", "Los Angeles Chargers": "lac",
+    "Los Angeles Rams": "lar", "Miami Dolphins": "mia", "Minnesota Vikings": "min",
+    "New England Patriots": "ne", "New Orleans Saints": "no", "New York Giants": "nyg",
+    "New York Jets": "nyj", "Philadelphia Eagles": "phi", "Pittsburgh Steelers": "pit",
+    "San Francisco 49ers": "sf", "Seattle Seahawks": "sea", "Tampa Bay Buccaneers": "tb",
+    "Tennessee Titans": "ten", "Washington Commanders": "wsh",
+}
+
+
+def _logo_url(team_name: str) -> str | None:
+    abbr = NFL_TEAM_ABBR.get(team_name)
+    return f"https://a.espncdn.com/i/teamlogos/nfl/500/{abbr}.png" if abbr else None
+
+
+def _inject_leaderboard_card_css():
+    """Ported from FVB-Platform's core/stat_leaderboard.py -- same class
+    names, same layout rules, same brand colors, including the desktop/
+    mobile compact-metrics-row breakpoint and the headshot circle's
+    zoomed-in image treatment."""
+    st.markdown(
+        f"""
+        <style>
+        .fvb-lb-card {{
+            border: 1px solid rgba(35, 31, 32, 0.12);
+            border-radius: 10px;
+            padding: 16px 20px;
+            margin-bottom: 4px;
+            background: #ffffff;
+        }}
+        .fvb-lb-row {{
+            display: flex;
+            align-items: center;
+            justify-content: space-between;
+            gap: 24px;
+            flex-wrap: wrap;
+        }}
+        .fvb-lb-left {{
+            display: flex;
+            align-items: center;
+            gap: 12px;
+            min-width: 180px;
+            flex: 1 1 200px;
+        }}
+        .fvb-lb-rank {{
+            font-weight: 700;
+            color: {_LB_NAVY};
+            font-size: 14px;
+            width: 26px;
+            flex-shrink: 0;
+        }}
+        .fvb-lb-headshot-wrap {{
+            width: 68px;
+            height: 68px;
+            border-radius: 50%;
+            overflow: hidden;
+            background: #eef0f5;
+            flex-shrink: 0;
+        }}
+        .fvb-lb-headshot {{
+            width: 100%;
+            height: 100%;
+            object-fit: cover;
+            /* The circle/container size above is unchanged — this only
+            scales the image content itself so a face fills more of the
+            circle, cropped by the wrapper's own overflow:hidden. */
+            transform: scale(1.15);
+        }}
+        .fvb-lb-name {{
+            font-weight: 600;
+            font-size: 15px;
+            color: #231F20;
+            line-height: 1.3;
+        }}
+        .fvb-lb-sub {{
+            font-size: 12px;
+            color: #6b7280;
+            line-height: 1.3;
+        }}
+        .fvb-lb-center {{
+            flex: 1 1 220px;
+            min-width: 180px;
+        }}
+        .fvb-lb-label {{
+            font-size: 11px;
+            color: #6b7280;
+            text-transform: uppercase;
+            letter-spacing: .03em;
+            margin-bottom: 4px;
+        }}
+        .fvb-lb-track {{
+            background: #eef0f5;
+            border-radius: 6px;
+            height: 8px;
+            width: 100%;
+            overflow: hidden;
+        }}
+        .fvb-lb-fill {{
+            background: {_LB_BLUE};
+            height: 100%;
+            border-radius: 6px;
+        }}
+        .fvb-lb-hr-value {{
+            font-size: 13px;
+            font-weight: 600;
+            color: #231F20;
+            margin-top: 4px;
+        }}
+        .fvb-lb-record {{
+            font-size: 12px;
+            color: #6b7280;
+        }}
+        .fvb-lb-right {{
+            text-align: right;
+            min-width: 90px;
+            flex: 0 1 110px;
+        }}
+        .fvb-lb-avg-value {{
+            font-size: 18px;
+            font-weight: 700;
+            color: {_LB_NAVY};
+        }}
+        .fvb-lb-metrics-desktop {{
+            display: flex;
+            align-items: center;
+            gap: 24px;
+            flex: 1 1 auto;
+            flex-wrap: wrap;
+        }}
+        .fvb-lb-metrics-mobile {{
+            display: none;
+        }}
+        .fvb-lb-mobile-metrics-row {{
+            display: flex;
+            gap: 10px;
+        }}
+        .fvb-lb-mobile-metric {{
+            flex: 1 1 0;
+            min-width: 0;
+        }}
+        @media (max-width: 480px) {{
+            .fvb-lb-card {{
+                padding: 12px 14px;
+            }}
+            .fvb-lb-headshot-wrap {{
+                width: 58px;
+                height: 58px;
+            }}
+            .fvb-lb-row {{
+                flex-direction: column;
+                align-items: stretch;
+                gap: 10px;
+            }}
+            .fvb-lb-left {{
+                flex: 0 0 auto;
+            }}
+            .fvb-lb-metrics-desktop {{
+                display: none;
+            }}
+            .fvb-lb-metrics-mobile {{
+                display: block;
+                width: 100%;
+            }}
+            .fvb-lb-mobile-metrics-row {{
+                margin-bottom: 8px;
+            }}
+        }}
+        </style>
+        """,
+        unsafe_allow_html=True,
+    )
+
+
+def _leaderboard_card_html(rank: int, r: dict, avg_label: str, headshot_or_logo: str | None) -> str:
+    pct = max(0.0, min(100.0, r["hit_rate"]))
+    name = html.escape(str(r["player"]))
+    team = html.escape(str(r["_team_display"]))
+    position = r.get("position")
+    sub = f"{team} • {html.escape(str(position))}" if position else team
+    img_html = (
+        f'<div class="fvb-lb-headshot-wrap"><img class="fvb-lb-headshot" '
+        f'src="{html.escape(headshot_or_logo)}" onerror="this.parentElement.style.display=\'none\'"></div>'
+        if headshot_or_logo else ""
+    )
+    avg_label_esc = html.escape(avg_label)
+    return f"""
+    <div class="fvb-lb-card">
+      <div class="fvb-lb-row">
+        <div class="fvb-lb-left">
+          <div class="fvb-lb-rank">#{rank}</div>
+          {img_html}
+          <div>
+            <div class="fvb-lb-name">{name}</div>
+            <div class="fvb-lb-sub">{sub}</div>
+          </div>
+        </div>
+        <div class="fvb-lb-metrics-desktop">
+          <div class="fvb-lb-center">
+            <div class="fvb-lb-label">Hit Rate</div>
+            <div class="fvb-lb-track"><div class="fvb-lb-fill" style="width:{pct:.0f}%"></div></div>
+            <div class="fvb-lb-hr-value">{pct:.0f}%</div>
+            <div class="fvb-lb-record">{r['hits']} / {r['games']}</div>
+          </div>
+          <div class="fvb-lb-right">
+            <div class="fvb-lb-label">{avg_label_esc}</div>
+            <div class="fvb-lb-avg-value">{r['avg']}</div>
+          </div>
+        </div>
+        <div class="fvb-lb-metrics-mobile">
+          <div class="fvb-lb-mobile-metrics-row">
+            <div class="fvb-lb-mobile-metric">
+              <div class="fvb-lb-label">Hit Rate</div>
+              <div class="fvb-lb-hr-value">{pct:.0f}%</div>
+            </div>
+            <div class="fvb-lb-mobile-metric">
+              <div class="fvb-lb-label">Record</div>
+              <div class="fvb-lb-hr-value">{r['hits']} / {r['games']}</div>
+            </div>
+            <div class="fvb-lb-mobile-metric">
+              <div class="fvb-lb-label">{avg_label_esc}</div>
+              <div class="fvb-lb-avg-value">{r['avg']}</div>
+            </div>
+          </div>
+          <div class="fvb-lb-track"><div class="fvb-lb-fill" style="width:{pct:.0f}%"></div></div>
+        </div>
+      </div>
+    </div>
+    """
+
+
+def _leaderboard_game_log_dataframe(game_log: list) -> pd.DataFrame:
+    """The exact sample games already computed by build_prop_leaderboard,
+    reshaped (not recalculated) into the four display columns -- no
+    filtering, resorting, or refetching happens here."""
+    return pd.DataFrame(
+        [
+            {
+                "Opponent": g["label"],
+                "Week / Date": g["date_or_week"],
+                "Result": g["result"],
+                "Outcome": g["outcome"],
+            }
+            for g in game_log
+        ]
+    )
 
 
 def render_leaderboard_view(supabase, now_utc):
@@ -117,10 +390,13 @@ def render_leaderboard_view(supabase, now_utc):
         st.info("Set your filters above and click **Find Top 10** to run the search.")
         return
 
-    st.markdown(f"### {_sub['side']} {_sub['line']:g} {_sub['stat_label']}")
+    _line_display = format_prop_line_value(_sub["stat_label"], _sub["line"])
+    st.markdown(f"### {_sub['stat_label']} | {_sub['side']} {_line_display}")
     st.caption(_sub["sample_label"])
 
-    with st.spinner("Scanning current-season player data..."):
+    _inject_leaderboard_card_css()
+
+    with st.spinner("Scanning current player data..."):
         # limit=None: the full sorted candidate list, so Team/Position can
         # narrow it BEFORE truncating to a top 10 for display — filtering
         # an already-truncated top 10 could return sparse/misleading
@@ -160,26 +436,29 @@ def render_leaderboard_view(supabase, now_utc):
     # matching the "team" field build_prop_leaderboard actually returns.
     _team_name_by_abbr = {abbr: name for name, abbr in _team_pairs}
 
+    # Ranked player cards (ported from FVB-Platform's core/
+    # stat_leaderboard.py) instead of a plain st.dataframe -- every number
+    # shown (hit rate, record, average, and each Recent Performance row)
+    # comes straight from build_prop_leaderboard's already-computed result
+    # dict; nothing here recalculates a sample or a hit rate independently.
     avg_label = PROP_AVG_LABEL.get(_sub["stat_label"], "Avg")
-    rows = []
     for i, r in enumerate(results, 1):
-        rows.append({
-            "Rank": i, "Player": r["player"],
-            "Team": _team_name_by_abbr.get(r["team"], r["team"]),
-            "Hit Rate": r["hit_rate"] / 100.0, "Record": f"{r['hits']} / {r['games']}", avg_label: r["avg"],
-        })
+        r["_team_display"] = _team_name_by_abbr.get(r["team"], r["team"])
+        headshot_or_logo = r.get("headshot_url") or _logo_url(r["_team_display"])
+        with st.container():
+            st.markdown(_leaderboard_card_html(i, r, avg_label, headshot_or_logo), unsafe_allow_html=True)
+            game_log = r.get("game_log") or []
+            with st.expander("Recent Performance", expanded=False):
+                if game_log:
+                    _gl_df = _leaderboard_game_log_dataframe(game_log)
+                    _gl_height = min(
+                        len(_gl_df) * _LB_GAME_LOG_ROW_HEIGHT + _LB_GAME_LOG_HEADER_HEIGHT,
+                        _LB_GAME_LOG_MAX_HEIGHT,
+                    )
+                    st.dataframe(_gl_df, use_container_width=True, hide_index=True, height=_gl_height)
+                else:
+                    st.caption("No individual game detail available for this result.")
 
-    df = pd.DataFrame(rows)
-    st.dataframe(
-        df, use_container_width=True, hide_index=True,
-        # "percent" (not a printf spec like "%.0f%%") is what actually
-        # scales this 0-1 fraction into percentage text — a printf format
-        # just prints the raw fraction with a literal "%" appended, so 0.4
-        # was rendering as "0%" instead of "40%". Same underlying value
-        # still drives both the bar fill (min/max 0-1) and the displayed
-        # number — same fix already shipped in MLB's equivalent leaderboard.
-        column_config={"Hit Rate": st.column_config.ProgressColumn("Hit Rate", format="percent", min_value=0.0, max_value=1.0)},
-    )
     if any(r["pushes"] > 0 for r in results):
         st.caption("Pushes (exact line matches) are excluded from both hits and the sample denominator.")
 
