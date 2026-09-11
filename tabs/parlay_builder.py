@@ -8,8 +8,8 @@ from core.odds_math import (
 )
 from core.pipeline import MARKETS, run_market_pipeline
 from core.data_sources import fetch_market_lines, filter_by_window, get_date_window, infer_current_week_index
-from core.nfl_prop_market_config import PROP_MARKETS
-from core.nfl_prop_pipeline import run_prop_market_pipeline
+from core.nfl_prop_market_config import PROP_MARKETS, normalize_player_key
+from core.nfl_prop_pipeline import run_prop_market_pipeline, build_prop_books_df
 from core.nfl_prop_data_sources import fetch_prop_market_lines, get_upcoming_prop_event_ids
 
 # Same team-abbreviation map and ESPN CDN logo URL pattern already used by
@@ -45,18 +45,54 @@ def _short_team(team_name) -> str:
 
 def _prop_bet_label(leg) -> str:
     """Compact pipe-separated prop leg label, e.g.
-    'McCaffrey | Rushing Yards | O60.5' -- short player surname (matching
-    the existing short-label convention already used for game-market
-    legs), full market name (no new abbreviation table), Over/Under-
-    abbreviated line. Used both as the "Bet" label in Current Parlay and
-    as the Remove-selectbox entry for prop legs."""
+    'McCaffrey | Rushing Yards | O' -- short player surname (matching the
+    existing short-label convention already used for game-market legs),
+    full market name (no new abbreviation table), Over/Under-abbreviated
+    side. No line: a Player Prop leg is now Player + Market + Side only
+    -- each sportsbook uses its own actual posted line for that side, so
+    there is no longer a single line this label could show without
+    implying a specific threshold that may not match every book. Used
+    both as the "Bet" label in Current Parlay and as the Remove-
+    selectbox entry for prop legs."""
     player = leg.get("Player", "")
     last_name = player.split()[-1] if player else "—"
     market = leg.get("Market", "")
     side = leg.get("Side", "")
-    line = leg.get("Line", "")
     side_abbr = "O" if side == "Over" else "U" if side == "Under" else side
-    return f"{last_name} | {market} | {side_abbr}{line}".strip()
+    return f"{last_name} | {market} | {side_abbr}".strip()
+
+
+def _prop_fair_prob_for_line(df_props: pd.DataFrame, leg, line_value) -> float | None:
+    """
+    Opportunistic EV lookup for ONE sportsbook's own specific prop line:
+    looks up the already-computed consensus fair probability (_fair_raw)
+    for this EXACT (Game, Market, Player, Side, line_value) combination
+    in df_props, returning None if no such row exists -- i.e. if that
+    specific line never cleared the existing MIN_BOOKS_FOR_PROP_CONSENSUS
+    coverage gate (an expected, common case now that different books can
+    each use their own unique threshold for the same Player+Market+Side
+    leg). Never searches nearby lines, averages, or otherwise substitutes
+    a different line's probability -- P(player over X) is a genuinely
+    different probability from P(player over Y) for X != Y, and this
+    must never silently blur the two together.
+    """
+    if df_props.empty or line_value is None or pd.isna(line_value):
+        return None
+    try:
+        _line_str = f"{float(line_value):g}"
+    except (TypeError, ValueError):
+        return None
+    match = df_props[
+        (df_props["Game"] == leg.get("Game")) &
+        (df_props["Market"] == leg.get("Market")) &
+        (df_props["Player"] == leg.get("Player")) &
+        (df_props["Side"] == leg.get("Side")) &
+        (df_props["Line"] == _line_str)
+    ]
+    if match.empty:
+        return None
+    fp = match.iloc[0].get("_fair_raw")
+    return float(fp) if pd.notna(fp) else None
 
 
 def _select_representative_line(candidate_rows: pd.DataFrame, tiebreak: str = "lower", group_key_fn=None) -> pd.DataFrame:
@@ -221,7 +257,15 @@ def _leg_odds_label(leg, df_all: pd.DataFrame, odds_format: str) -> str:
     """The selected side's current odds, in the currently selected Odds
     Format — for the Current Parlay table's separate Odds column. Looked
     up fresh from the already-fetched pipeline output (Best Odds), same
-    source Browse Games uses for the same pick."""
+    source Browse Games uses for the same pick.
+
+    Player Props are line-agnostic now (Player + Market + Side, not a
+    specific threshold) -- each sportsbook uses its own actual posted
+    line, so there is no longer a single "the odds" to show before
+    Compare Parlay Odds resolves each book's own line/price explicitly.
+    """
+    if leg.get("Type") == "prop":
+        return "—"
     odds = _leg_best_odds(leg, df_all)
     return _fmt_odds_in_format(odds, odds_format) if odds is not None else "—"
 
@@ -314,6 +358,41 @@ def _load_parlay_builder_props(_supabase, event_ids: tuple, window_start, window
     return pd.concat(_all_prop_display, ignore_index=True) if _all_prop_display else pd.DataFrame()
 
 
+@st.cache_data(ttl=300, show_spinner=False)
+def _load_parlay_builder_prop_books(_supabase, event_ids: tuple, window_start, window_end) -> dict[str, pd.DataFrame]:
+    """
+    Pure computation: fetch + pivot (build_prop_books_df, unmodified --
+    NOT run through run_prop_market_pipeline's devig/consensus/coverage
+    gate) every Phase-1 FVB player-prop market's raw per-book lines.
+
+    Player Props legs are now line-agnostic (Player + Market + Side, not
+    a specific threshold) -- each sportsbook uses its own actual posted
+    line for that side, so both browsing (which players/markets/sides
+    are actually offered) and Compare Parlay Odds (each book's own line
+    + price) must read raw per-book data, not the consensus-gated FVB
+    pipeline output (df_props / run_prop_market_pipeline). That pipeline
+    drops any line with fewer than MIN_BOOKS_FOR_PROP_CONSENSUS books --
+    exactly the case where three different books each post their own
+    unique line for the same player/market (58.5, 59.5, 60.5, one book
+    apiece) and none of them would individually clear the gate, even
+    though each is a perfectly real, bettable line at that book.
+
+    df_props (still loaded separately, unchanged) is NOT replaced by
+    this -- it remains the source for an opportunistic EV%/fair-
+    probability lookup when a specific book's own line happens to also
+    be a consensus-priced one (see _prop_fair_prob_for_line above).
+    """
+    _books: dict[str, pd.DataFrame] = {}
+    for _mkt_key, _mkt_cfg in PROP_MARKETS.items():
+        if not event_ids:
+            _books[_mkt_cfg.market_label] = pd.DataFrame()
+            continue
+        _raw = fetch_prop_market_lines(_supabase, list(event_ids), _mkt_key)
+        _raw = filter_by_window(_raw, window_start, window_end)
+        _books[_mkt_cfg.market_label] = build_prop_books_df(_raw, _mkt_cfg)
+    return _books
+
+
 def render(supabase, now_utc, eff_bankroll, eff_kelly, authed):
     if not authed:
         st.warning("Sign in to use the Parlay Builder.")
@@ -361,6 +440,13 @@ def render(supabase, now_utc, eff_bankroll, eff_kelly, authed):
         _prop_event_ids = get_upcoming_prop_event_ids(supabase, window_start.isoformat(), window_end.isoformat())
         df_props = _load_parlay_builder_props(
             supabase, tuple(_prop_event_ids), window_start, window_end, eff_bankroll, eff_kelly,
+        )
+        # Raw (ungated) per-book prop pivot -- the source of truth for
+        # Player Props browsing and Compare Parlay Odds now that a prop
+        # leg is line-agnostic; see _load_parlay_builder_prop_books'
+        # docstring for why this can't be df_props.
+        _prop_books_pb = _load_parlay_builder_prop_books(
+            supabase, tuple(_prop_event_ids), window_start, window_end,
         )
         # Game-market and prop display rows already share the same Game/
         # Market/Pick/Line/_fair_raw/Best Odds/mi_book_table column shape
@@ -440,70 +526,91 @@ def render(supabase, now_utc, eff_bankroll, eff_kelly, authed):
                     from core.pipeline import build_books_df
                     _markets_pb[_mkt_cfg.market_label] = build_books_df(_raw_p, _mkt_cfg)
 
-                # Prop books come from each priced prop row's own
-                # mi_book_table (already computed, unmodified, by
-                # build_market_intelligence inside run_prop_market_pipeline)
-                # rather than a raw per-book pivot like _markets_pb above --
-                # a book that only carries player props (no game-market
-                # coverage in this window) would otherwise be silently
-                # excluded from every_book and never considered able to
-                # cover a prop-only or mixed parlay.
+                # Prop books come from the raw per-book pivot loaded above
+                # (_prop_books_pb) -- a Player Prop leg is now line-
+                # agnostic (Player + Market + Side only), so eligibility
+                # can no longer be scoped through a single consensus-
+                # priced row's mi_book_table (that one exact-line row no
+                # longer represents "the" leg). Any book with a non-null
+                # Over/Under price for this player/market, at ANY line,
+                # can carry the leg -- using ITS OWN line and price,
+                # never another book's.
                 _prop_books = set()
-                if not df_props.empty and "mi_book_table" in df_props.columns:
-                    for _bt in df_props["mi_book_table"].dropna():
-                        if isinstance(_bt, list):
-                            _prop_books.update(_b.get("_book_key") for _b in _bt if _b.get("_book_key"))
+                for _pb_df in _prop_books_pb.values():
+                    if _pb_df.empty:
+                        continue
+                    _has_price = _pb_df["over_price"].notna() | _pb_df["under_price"].notna()
+                    _prop_books.update(_pb_df.loc[_has_price, "book"].unique())
 
                 every_book = sorted(set(
                     b for df in _markets_pb.values() if not df.empty for b in df["book"].unique()
                 ) | _prop_books)
 
-                # Combined fair probability for the parlay = product of
-                # each leg's own consensus fair probability, looked up
-                # from the pipeline output already fetched above (no new
-                # fetch). This treats legs as statistically independent —
-                # an explicit, documented assumption, not a hidden one:
-                # no canonical parlay-level fair-probability methodology
-                # exists elsewhere in this repo (verified by inspecting
-                # core/odds_math.py, core/pipeline.py, and
-                # core/arbitrage_engine.py), and this does not attempt to
-                # model correlation between legs (e.g. same-game legs).
-                # Book-independent, so computed once outside the
-                # per-book loop below; reuses expected_value_pct
-                # (core/odds_math.py) — no new EV formula.
-                _combined_fair_prob = 1.0
-                _fair_prob_valid = True
-                for leg in st.session_state.pb_parlay_legs:
-                    _fp = _leg_fair_prob(leg, df_all_combined)
-                    if _fp is None:
-                        _fair_prob_valid = False
-                        break
-                    _combined_fair_prob *= _fp
-
+                # Combined fair probability is now computed PER BOOK,
+                # not once book-independent as before Player Props became
+                # line-agnostic. Spread/Total/Moneyline legs still use
+                # exactly one representative line (or no line at all) for
+                # every book, so their own fair probability (_leg_fair_prob,
+                # unchanged) is genuinely identical regardless of book --
+                # recomputing it per book changes nothing for them, and
+                # this still treats every leg as statistically independent,
+                # the same explicit, documented assumption as before (no
+                # canonical parlay-level fair-probability methodology
+                # exists elsewhere in this repo, and this does not attempt
+                # to model correlation between legs). Prop legs are
+                # different now: two books can each carry the SAME selected
+                # Player+Market+Side at two DIFFERENT thresholds, and
+                # P(player over 58.5) is a genuinely different probability
+                # from P(player over 60.5) -- there is no single "the" fair
+                # probability for a line-agnostic prop leg anymore. Each
+                # book's own EV% must use ITS OWN line's already-computed
+                # consensus fair probability (_prop_fair_prob_for_line, an
+                # opportunistic lookup against the unmodified FVB pipeline
+                # output in df_props) when that specific line happens to
+                # have cleared the existing 2-book coverage gate, and must
+                # honestly show "—" rather than reuse a mismatched
+                # probability when it hasn't -- never interpolated,
+                # averaged, or substituted from a different line. Still
+                # reuses expected_value_pct (core/odds_math.py) unmodified
+                # -- no new EV formula.
                 results = []
+                _prop_line_disclosure_rows = []
                 for book in every_book:
                     combined_dec = 1.0
                     valid = True
+                    _book_fair_prob = 1.0
+                    _book_fair_prob_valid = True
+                    _book_prop_lines = []  # (leg, this book's own line) pairs, for the transparency table below
                     for leg in st.session_state.pb_parlay_legs:
                         if leg.get("Type") == "prop":
-                            # Prop legs don't have a raw per-book pivot like
-                            # _markets_pb -- their per-book prices live in
-                            # mi_book_table on that leg's own already-priced
-                            # row in df_props (same _leg_pipeline_row lookup
-                            # used elsewhere in this file for game-market
-                            # legs; it matches generically on Game/Market/
-                            # Pick/Line, so it works unchanged here too).
-                            _prow = _leg_pipeline_row(leg, df_props)
-                            if _prow is None:
+                            _pb_df = _prop_books_pb.get(leg["Market"])
+                            if _pb_df is None or _pb_df.empty:
                                 valid = False; break
-                            _book_table = _prow.get("mi_book_table")
-                            if not isinstance(_book_table, list):
+                            _target_key = normalize_player_key(leg.get("Player"))
+                            _price_col = "over_price" if leg.get("Side") == "Over" else "under_price"
+                            _s = _pb_df[
+                                (_pb_df["book"] == book) &
+                                (_pb_df["player_key"] == _target_key) &
+                                ((_pb_df["home_team"] + " vs " + _pb_df["away_team"]) == leg["Game"]) &
+                                _pb_df[_price_col].notna()
+                            ]
+                            if _s.empty:
                                 valid = False; break
-                            _odds_key = "_odds_a_raw" if leg.get("Side") == "Over" else "_odds_b_raw"
-                            _book_entry = next((b for b in _book_table if b.get("_book_key") == book), None)
-                            if _book_entry is None or _book_entry.get(_odds_key) is None:
-                                valid = False; break
-                            price = _book_entry[_odds_key]
+                            # A book posts one live line per player/market
+                            # in the normal case; if more than one row is
+                            # present (e.g. a captured line move), the
+                            # first is used -- same "first row wins"
+                            # convention already used for the game-market
+                            # raw pivot above, not a new tie-break rule.
+                            _prow = _s.iloc[0]
+                            price = _prow[_price_col]
+                            _book_line = _prow.get("line")
+                            _book_prop_lines.append((leg, _book_line))
+                            _fp = _prop_fair_prob_for_line(df_props, leg, _book_line)
+                            if _fp is None:
+                                _book_fair_prob_valid = False
+                            else:
+                                _book_fair_prob *= _fp
                         else:
                             src = _markets_pb.get(leg["Market"])
                             if src is None or src.empty:
@@ -523,9 +630,7 @@ def render(supabase, now_utc, eff_bankroll, eff_kelly, authed):
                             # "total" (Total) column needed to enforce this --
                             # no new data, just the equality check that was
                             # missing. Moneyline has no line concept and is
-                            # untouched. This mirrors the exact-line scoping
-                            # the prop branch above already had via
-                            # mi_book_table.
+                            # untouched.
                             if leg["Market"] == "Spread" and not s.empty:
                                 _home_team_name, _, _ = leg["Game"].partition(" vs ")
                                 try:
@@ -550,6 +655,11 @@ def render(supabase, now_utc, eff_bankroll, eff_kelly, authed):
                                 price = row["home_price"] if leg["Pick"] == row["home_team"] else row["away_price"]
                             else:
                                 price = row["over_price"] if leg["Pick"].lower() == "over" else row["under_price"]
+                            _fp = _leg_fair_prob(leg, df_all_combined)
+                            if _fp is None:
+                                _book_fair_prob_valid = False
+                            else:
+                                _book_fair_prob *= _fp
                         try:
                             combined_dec *= american_to_decimal(price)
                         except Exception:
@@ -561,8 +671,8 @@ def render(supabase, now_utc, eff_bankroll, eff_kelly, authed):
                         pa = int((combined_dec - 1) * 100) if combined_dec >= 2 else int(-100 / (combined_dec - 1))
                         _profit = round(stake * (combined_dec - 1), 2)
                         _ev_str = (
-                            fmt_ev(expected_value_pct(_combined_fair_prob, pa))
-                            if _fair_prob_valid else "—"
+                            fmt_ev(expected_value_pct(_book_fair_prob, pa))
+                            if _book_fair_prob_valid else "—"
                         )
                         results.append({
                             "Sportsbook": book,
@@ -571,6 +681,13 @@ def render(supabase, now_utc, eff_bankroll, eff_kelly, authed):
                             "Profit ($)": f"${_profit:,.2f}",
                             "EV%": _ev_str,
                         })
+                        for _leg, _line_val in _book_prop_lines:
+                            if pd.notna(_line_val):
+                                _prop_line_disclosure_rows.append({
+                                    "Sportsbook": book,
+                                    "Prop Leg": _prop_bet_label(_leg),
+                                    "Actual Line": f"{float(_line_val):g}",
+                                })
 
                 if not results:
                     st.warning("No sportsbook has all selected legs available.")
@@ -580,6 +697,25 @@ def render(supabase, now_utc, eff_bankroll, eff_kelly, authed):
                         pd.DataFrame(results).sort_values("Payout ($)", ascending=False),
                         use_container_width=True, hide_index=True,
                     )
+                    if _prop_line_disclosure_rows:
+                        # Transparency requirement: different sportsbooks
+                        # can now use different actual thresholds for the
+                        # same selected Player Prop leg (that's the whole
+                        # point of this design) -- this must never be
+                        # implied to be the same wager. Kept out of the
+                        # main comparison table (which stays concise) and
+                        # surfaced here instead, same lightweight
+                        # expander+table pattern already used elsewhere in
+                        # this app for secondary detail.
+                        with st.expander("View sportsbook-specific prop lines"):
+                            st.caption(
+                                "Player Prop legs use each sportsbook's own actual "
+                                "posted line — thresholds can differ by book."
+                            )
+                            st.dataframe(
+                                pd.DataFrame(_prop_line_disclosure_rows),
+                                use_container_width=True, hide_index=True,
+                            )
 
         st.divider()
         st.markdown("### Browse Games")
@@ -667,48 +803,54 @@ def render(supabase, now_utc, eff_bankroll, eff_kelly, authed):
                 # "Bets". The label and contents both swap on _pb_mode.
                 with st.expander("Props" if _pb_mode == "Player Props" else "Bets", expanded=False):
                     if _pb_mode == "Player Props":
-                        _game_prop_rows = df_props[
-                            (df_props["Game"] == _game_label) & (df_props["commence_time"] == _commence_iso)
-                        ] if not df_props.empty else pd.DataFrame()
+                        # Player -> Market -> Over/Under, driven by the raw
+                        # (ungated) per-book pivot loaded above, not the
+                        # consensus-priced df_props -- a market/side is
+                        # offered here as soon as ANY book prices it, even
+                        # if that book is the only one at its own specific
+                        # line (see _load_parlay_builder_prop_books'
+                        # docstring). The player is only ever deciding a
+                        # direction now, not a threshold, so no
+                        # representative-line selection happens here at all.
+                        _game_prop_players = set()
+                        for _pb_df in _prop_books_pb.values():
+                            if _pb_df.empty:
+                                continue
+                            _g = _pb_df[(_pb_df["home_team"] + " vs " + _pb_df["away_team"]) == _game_label]
+                            if not _g.empty:
+                                _game_prop_players.update(_g["player_display"].dropna().unique())
 
-                        if _game_prop_rows.empty:
-                            st.caption("No priced player props available for this game yet.")
+                        if not _game_prop_players:
+                            st.caption("No player props available for this game yet.")
                         else:
-                            # Game -> Player -> Prop Market -> Over/Under,
-                            # per the approved flow -- Player is a single
-                            # selectbox scoped to just this game's own
-                            # priced-prop roster (not every player league-
-                            # wide), so the list stays short regardless of
-                            # how many games are in the current window.
-                            _prop_players = sorted(_game_prop_rows["Player"].dropna().unique())
                             _picked_player = st.selectbox(
-                                "Player", _prop_players,
+                                "Player", sorted(_game_prop_players),
                                 key=f"pb_prop_player_{_game_label}_{_commence_iso}",
                                 label_visibility="collapsed",
                             )
-                            _player_prop_rows = _game_prop_rows[_game_prop_rows["Player"] == _picked_player]
+                            _target_player_key = normalize_player_key(_picked_player)
 
-                            # Only that player's markets with an actual
-                            # FVB-priced row appear -- never the full
-                            # Phase-1 market list regardless of coverage.
-                            # One row per market: the user is only ever
-                            # deciding Over or Under on a single
-                            # representative line, never choosing between
-                            # several sportsbook-specific versions of the
-                            # same market.
-                            for _prop_mkt in sorted(_player_prop_rows["Market"].dropna().unique()):
-                                _mkt_prop_rows = _player_prop_rows[_player_prop_rows["Market"] == _prop_mkt]
-                                _rep_rows = _select_representative_line(_mkt_prop_rows, tiebreak="lower")
-                                if _rep_rows.empty:
+                            # Player is already chosen via the selectbox
+                            # above -- the market header doesn't repeat it.
+                            _any_market_rendered = False
+                            for _prop_mkt_key, _prop_cfg in PROP_MARKETS.items():
+                                _prop_mkt_label = _prop_cfg.market_label
+                                _mkt_pb_df = _prop_books_pb.get(_prop_mkt_label, pd.DataFrame())
+                                if _mkt_pb_df.empty:
                                     continue
-                                _over_rows = _rep_rows[_rep_rows["Side"] == "Over"]
-                                _under_rows = _rep_rows[_rep_rows["Side"] == "Under"]
-                                _over_row = _over_rows.iloc[0] if not _over_rows.empty else None
-                                _under_row = _under_rows.iloc[0] if not _under_rows.empty else None
-                                if _over_row is None and _under_row is None:
+                                _player_rows = _mkt_pb_df[
+                                    ((_mkt_pb_df["home_team"] + " vs " + _mkt_pb_df["away_team"]) == _game_label)
+                                    & (_mkt_pb_df["player_key"] == _target_player_key)
+                                ]
+                                if _player_rows.empty:
                                     continue
+                                _has_over = _player_rows["over_price"].notna().any()
+                                _has_under = _player_rows["under_price"].notna().any()
+                                if not _has_over and not _has_under:
+                                    continue
+                                _any_market_rendered = True
 
-                                st.markdown(f"**{_picked_player} | {_prop_mkt}**")
+                                st.markdown(f"**{_prop_mkt_label}**")
 
                                 # Only one side of one market can be
                                 # selected at a time -- same "one pick per
@@ -719,42 +861,46 @@ def render(supabase, now_utc, eff_bankroll, eff_kelly, authed):
                                 _added_leg_for_mkt = next(
                                     (l for l in st.session_state.pb_parlay_legs
                                      if l.get("Type") == "prop" and l.get("_commence") == _commence_iso
-                                     and l.get("Market") == _prop_mkt and l.get("Player") == _picked_player),
+                                     and l.get("Market") == _prop_mkt_label and l.get("Player") == _picked_player),
                                     None,
                                 )
                                 _added_side = _added_leg_for_mkt.get("Side") if _added_leg_for_mkt else None
 
                                 _oc, _uc = st.columns(2)
-                                for _col, _side_row, _side_name in [(_oc, _over_row, "Over"), (_uc, _under_row, "Under")]:
-                                    if _side_row is None:
+                                for _col, _side_available, _side_name in [(_oc, _has_over, "Over"), (_uc, _has_under, "Under")]:
+                                    if not _side_available:
                                         continue
-                                    _side_label = f"{_side_name} {_side_row['Line']}"
+                                    # No Line stored -- a Player Prop leg is
+                                    # now identified by Game/Player/Market/
+                                    # Side only; each sportsbook resolves
+                                    # its own actual line at Compare time.
                                     _side_leg = {
-                                        "Type": "prop", "Market": _prop_mkt, "Game": _side_row["Game"],
-                                        "Pick": _side_row["Pick"], "Line": _side_row["Line"],
-                                        "Player": _side_row["Player"], "Side": _side_name,
-                                        "_commence": _commence_iso,
+                                        "Type": "prop", "Market": _prop_mkt_label, "Game": _game_label,
+                                        "Pick": f"{_picked_player} {_side_name}", "Player": _picked_player,
+                                        "Side": _side_name, "_commence": _commence_iso,
                                     }
-                                    _btn_key = f"pb_add_prop_{_game_label}_{_commence_iso}_{_prop_mkt}_{_picked_player}_{_side_name}"
+                                    _btn_key = f"pb_add_prop_{_game_label}_{_commence_iso}_{_prop_mkt_label}_{_picked_player}_{_side_name}"
                                     if _added_side == _side_name:
-                                        if _col.button(f"✓ {_side_label}", key=_btn_key,
+                                        if _col.button(f"✓ {_side_name}", key=_btn_key,
                                                         use_container_width=True, type="primary"):
                                             st.session_state.pb_parlay_legs = [
                                                 l for l in st.session_state.pb_parlay_legs
                                                 if not (
                                                     l.get("Type") == "prop" and l.get("_commence") == _commence_iso
-                                                    and l.get("Market") == _prop_mkt
+                                                    and l.get("Market") == _prop_mkt_label
                                                     and l.get("Player") == _picked_player
                                                     and l.get("Side") == _side_name
                                                 )
                                             ]
                                             _fragment_rerun()
                                     elif _added_side is not None:
-                                        _col.button(_side_label, key=_btn_key, disabled=True, use_container_width=True)
+                                        _col.button(_side_name, key=_btn_key, disabled=True, use_container_width=True)
                                     else:
-                                        if _col.button(_side_label, key=_btn_key, use_container_width=True):
+                                        if _col.button(_side_name, key=_btn_key, use_container_width=True):
                                             st.session_state.pb_parlay_legs.append(_side_leg)
                                             _fragment_rerun()
+                            if not _any_market_rendered:
+                                st.caption("No player props available for this player yet.")
                     else:
                         for _mkt_name in ["Moneyline", "Spread", "Total"]:
                             _mkt_rows = _game_rows[_game_rows["Market"] == _mkt_name]
