@@ -1,4 +1,6 @@
 # tabs/parlay_builder.py
+from decimal import Decimal, ROUND_HALF_UP
+
 import pandas as pd
 import streamlit as st
 
@@ -44,22 +46,40 @@ def _short_team(team_name) -> str:
 
 
 def _prop_bet_label(leg) -> str:
-    """Compact pipe-separated prop leg label, e.g.
-    'McCaffrey | Rushing Yards | O' -- short player surname (matching the
-    existing short-label convention already used for game-market legs),
-    full market name (no new abbreviation table), Over/Under-abbreviated
-    side. No line: a Player Prop leg is now Player + Market + Side only
-    -- each sportsbook uses its own actual posted line for that side, so
-    there is no longer a single line this label could show without
-    implying a specific threshold that may not match every book. Used
-    both as the "Bet" label in Current Parlay and as the Remove-
-    selectbox entry for prop legs."""
+    """Prop leg label, e.g. 'McCaffrey Over · Rushing Yards' -- short
+    player surname (matching the existing short-label convention already
+    used for game-market legs), full Over/Under word, full market name
+    (no new abbreviation table). No line: a Player Prop leg is now
+    Player + Market + Side only -- each sportsbook uses its own actual
+    posted line for that side, so there is no longer a single line this
+    label could show without implying a specific threshold that may not
+    match every book. Used both as the "Bet" label in Current Parlay and
+    as the Remove-selectbox entry for prop legs."""
     player = leg.get("Player", "")
     last_name = player.split()[-1] if player else "—"
     market = leg.get("Market", "")
     side = leg.get("Side", "")
-    side_abbr = "O" if side == "Over" else "U" if side == "Under" else side
-    return f"{last_name} | {market} | {side_abbr}".strip()
+    return f"{last_name} {side} · {market}".strip()
+
+
+# Unit word for the informational average-line display below, per Phase 1
+# market (core/nfl_prop_market_config.py::PROP_MARKETS) -- "yards" would be
+# wrong for a count stat like Passing TDs/Receptions, so this is an
+# explicit small map rather than a blanket suffix. A market with no entry
+# here simply displays with no unit word.
+_PROP_AVG_UNIT = {
+    "Passing Yards": "yards", "Rushing Yards": "yards", "Receiving Yards": "yards",
+    "Passing TDs": "TDs", "Receptions": "receptions",
+}
+
+
+def _fmt_avg_line(value: float) -> str:
+    """Always exactly 1 decimal place, standard round-half-up (not
+    Python's default round-half-to-even, which would render 59.25 as
+    "59.2" instead of the expected "59.3") -- via Decimal so the
+    rounding is exact regardless of the value's binary float
+    representation. Trailing zero always preserved (e.g. 40 -> "40.0")."""
+    return str(Decimal(str(value)).quantize(Decimal("0.1"), rounding=ROUND_HALF_UP))
 
 
 def _prop_fair_prob_for_line(df_props: pd.DataFrame, leg, line_value) -> float | None:
@@ -869,10 +889,12 @@ def render(supabase, now_utc, eff_bankroll, eff_kelly, authed):
                                     sum(float(v) for v in _avg_line_vals) / len(_avg_line_vals)
                                     if len(_avg_line_vals) else None
                                 )
-                                _mkt_header = (
-                                    f"**{_prop_mkt_label}** · Avg Line {_avg_line:g}"
-                                    if _avg_line is not None else f"**{_prop_mkt_label}**"
-                                )
+                                if _avg_line is not None:
+                                    _avg_unit = _PROP_AVG_UNIT.get(_prop_mkt_label, "")
+                                    _avg_text = _fmt_avg_line(_avg_line) + (f" {_avg_unit}" if _avg_unit else "")
+                                    _mkt_header = f"**{_prop_mkt_label}** · {_avg_text}"
+                                else:
+                                    _mkt_header = f"**{_prop_mkt_label}**"
                                 st.markdown(_mkt_header)
 
                                 # Only one side of one market can be
