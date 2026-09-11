@@ -261,15 +261,24 @@ def newest_favicon():
     return max(cands, key=lambda p: p.stat().st_mtime)
 LOGO_PATH    = find_asset("logo.png")
 FAVICON_PATH = newest_favicon()
-favicon_img = None
+# page_icon is passed as the asset's file PATH (a string), not an opened
+# PIL Image object -- page_icon accepts either, but an in-memory Image
+# has proven less reliable for the browser-tab favicon across Streamlit
+# versions/deployment environments (this app pins no streamlit version,
+# so a redeploy can pick up a newer release), whereas a plain path is
+# the most universally supported form. Image.open(...).verify() below
+# only confirms the file is a genuine, uncorrupted image before using
+# its path -- it never touches the actual rendered icon.
+favicon_ok = False
 if FAVICON_PATH:
     try:
-        favicon_img = Image.open(FAVICON_PATH)
+        Image.open(FAVICON_PATH).verify()
+        favicon_ok = True
     except Exception:
-        favicon_img = None
+        favicon_ok = False
 st.set_page_config(
     page_title="Fair Value Betting · NFL",
-    page_icon=(favicon_img if favicon_img else "🏈"),
+    page_icon=(str(FAVICON_PATH) if favicon_ok else "🏈"),
     layout="wide",
     initial_sidebar_state="expanded",
 )
