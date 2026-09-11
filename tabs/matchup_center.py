@@ -7,7 +7,9 @@ from core.pipeline import MARKETS, run_market_pipeline
 from core.data_sources import fetch_market_lines, filter_by_window, get_date_window, infer_current_week_index
 from core.nfl_live_scores import fetch_nfl_scoreboard, get_game_status, format_live_line
 from core.nflverse_data import get_current_season
-from core.nfl_matchup_context import TEAM_COMPARISON_METRICS, get_team_comparison_stats, get_team_recent_form
+from core.nfl_matchup_context import (
+    TEAM_COMPARISON_METRICS, get_team_comparison_with_fallback, get_team_recent_form_with_fallback,
+)
 from core.nfl_injuries_data import get_team_injuries
 
 TIPS = {
@@ -298,8 +300,14 @@ def render(supabase, now_utc, eff_bankroll, eff_kelly):
                 # red-zone efficiency data exists in this dataset, so
                 # those metrics are intentionally not included).
                 st.markdown("#### Team Comparison")
-                _away_cmp = get_team_comparison_stats(_nfl_season, _at)
-                _home_cmp = get_team_comparison_stats(_nfl_season, _ht)
+                # Falls back to season - 1 for BOTH teams together when
+                # current-season stats aren't usable for one or both yet
+                # (early season) -- see get_team_comparison_with_fallback.
+                # The metric computation itself (get_team_comparison_stats)
+                # is unchanged; this only decides which season to call it
+                # with, and reverts to current-season data automatically
+                # once it's available.
+                _away_cmp, _home_cmp, _cmp_season = get_team_comparison_with_fallback(_nfl_season, _at, _ht)
                 if _away_cmp and _home_cmp:
                     _cmp_rows = []
                     for _cmp_key, _cmp_label in TEAM_COMPARISON_METRICS:
@@ -313,6 +321,8 @@ def render(supabase, now_utc, eff_bankroll, eff_kelly):
                             _hv_s = f"{_hv:.1f}" if _hv is not None else "—"
                         _cmp_rows.append({"Away": _av_s, "Metric": _cmp_label, "Home": _hv_s})
                     st.dataframe(pd.DataFrame(_cmp_rows), use_container_width=True, hide_index=True)
+                    if _cmp_season is not None and _nfl_season is not None and _cmp_season != _nfl_season:
+                        st.caption(f"Using {_cmp_season} regular-season stats until {_nfl_season} data is available.")
                     st.caption(
                         f"Season-to-date, through {_away_cmp['games_played']} ({_at}) / "
                         f"{_home_cmp['games_played']} ({_ht}) games played."
@@ -323,13 +333,25 @@ def render(supabase, now_utc, eff_bankroll, eff_kelly):
 
                 # ── 3. Recent Form ─────────────────────────────────
                 st.markdown("#### Recent Form")
-                _away_form = get_team_recent_form(_nfl_season, _at, n=5)
-                _home_form = get_team_recent_form(_nfl_season, _ht, n=5)
+                # Each team independently falls back to its own most
+                # recent completed prior-season games when it has zero
+                # completed current-season games -- a binary switch, not
+                # a blended cross-season window (see
+                # get_team_recent_form_with_fallback). It's expected for
+                # one team to be on the current season and the other on
+                # the prior season within the same matchup.
+                _away_form, _away_form_season = get_team_recent_form_with_fallback(_nfl_season, _at, n=5)
+                _home_form, _home_form_season = get_team_recent_form_with_fallback(_nfl_season, _ht, n=5)
                 _rf_c1, _rf_c2 = st.columns(2)
-                for _rf_col, _rf_team, _rf_form in ((_rf_c1, _at, _away_form), (_rf_c2, _ht, _home_form)):
+                for _rf_col, _rf_team, _rf_form, _rf_form_season in (
+                    (_rf_c1, _at, _away_form, _away_form_season),
+                    (_rf_c2, _ht, _home_form, _home_form_season),
+                ):
                     with _rf_col:
                         st.caption(_rf_team)
                         if _rf_form:
+                            if _rf_form_season is not None and _nfl_season is not None and _rf_form_season != _nfl_season:
+                                st.caption(f"Showing {_rf_form_season} recent form until {_nfl_season} games are completed.")
                             st.write(
                                 f"Last {len(_rf_form['games'])}: {_rf_form['record']} · "
                                 f"Avg {_rf_form['avg_scored']}-{_rf_form['avg_allowed']} "

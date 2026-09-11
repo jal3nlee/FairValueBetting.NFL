@@ -169,3 +169,77 @@ def get_team_recent_form(season: int, team_full_name: str, n: int = 5) -> dict |
         "avg_allowed": avg_allowed,
         "avg_margin": round(avg_scored - avg_allowed, 1),
     }
+
+
+# ── Early-season prior-season fallback ──────────────────────────────
+# Thin orchestration only -- get_team_comparison_stats/get_team_recent_
+# form above are completely unchanged (same fields, same computation,
+# same None-on-unavailable contract). These wrappers just decide WHICH
+# season(s) to call them with, so Matchup Center stays useful before the
+# current season has enough completed games, then reverts automatically
+# once it does.
+def get_team_comparison_with_fallback(
+    season: int, away_team_full_name: str, home_team_full_name: str,
+) -> tuple[dict | None, dict | None, int | None]:
+    """
+    Matchup-level wrapper: if either team has no usable CURRENT-season
+    comparison yet, falls back to season - 1 for BOTH teams together --
+    never one team on the current season and the other on the prior one
+    (get_team_comparison_stats itself is called unmodified either way).
+    Returns (away_stats, home_stats, resolved_season); resolved_season is
+    the season the returned stats actually belong to (season, or
+    season - 1 on fallback), or None if `season` itself is None.
+
+    Known limitation: get_team_comparison_stats returns None both when a
+    team genuinely has zero games played yet this season (the expected
+    early-season case this fallback exists for) and when the underlying
+    nflreadpy fetch fails or the team can't be resolved at all -- it
+    doesn't currently expose which case occurred. This wrapper can
+    therefore also fall back to the prior season on a genuine data
+    failure, not only on legitimate early-season absence. Distinguishing
+    the two would require changing get_team_comparison_stats' own return
+    contract, which is broader than this fallback -- not done here.
+    """
+    if season is None:
+        return None, None, None
+    away_cur = get_team_comparison_stats(season, away_team_full_name)
+    home_cur = get_team_comparison_stats(season, home_team_full_name)
+    if away_cur and home_cur:
+        return away_cur, home_cur, season
+
+    prior_season = season - 1
+    away_prior = get_team_comparison_stats(prior_season, away_team_full_name)
+    home_prior = get_team_comparison_stats(prior_season, home_team_full_name)
+    return away_prior, home_prior, prior_season
+
+
+def get_team_recent_form_with_fallback(
+    season: int, team_full_name: str, n: int = 5,
+) -> tuple[dict | None, int | None]:
+    """
+    Per-team wrapper: if the team has zero completed games in `season`
+    yet, falls back to that team's most recent completed games from
+    season - 1 (get_team_recent_form itself unmodified either way) --
+    never a blended cross-season sample. This is a binary switch (0
+    current-season completed games -> prior season; 1+ -> current season
+    exactly as returned by get_team_recent_form, even if that's fewer
+    than `n` games), not a rolling window across the season boundary.
+    Returns (form, resolved_season); resolved_season is None only if
+    `season` itself is None. Each team is resolved independently, so
+    it's expected for one team to land on the current season and the
+    other on the prior season within the same matchup.
+
+    Same known limitation as get_team_comparison_with_fallback above:
+    get_team_recent_form returns None for both "genuinely no completed
+    games yet" and "team unresolved / fetch failed," so this fallback
+    can't distinguish the two without a change to that function's return
+    contract.
+    """
+    if season is None:
+        return None, None
+    cur = get_team_recent_form(season, team_full_name, n=n)
+    if cur:
+        return cur, season
+    prior_season = season - 1
+    prior = get_team_recent_form(prior_season, team_full_name, n=n)
+    return prior, prior_season
