@@ -22,7 +22,7 @@ def render(supabase, now_utc):
     )
 
     _section = st.segmented_control(
-        "Section", ["Lineup Analysis", "Draft Rankings"], default="Lineup Analysis",
+        "Section", ["Lineup Analysis", "Position Rankings"], default="Lineup Analysis",
         key="ft_section", label_visibility="collapsed",
     ) or "Lineup Analysis"
 
