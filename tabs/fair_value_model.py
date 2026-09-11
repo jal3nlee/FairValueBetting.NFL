@@ -229,27 +229,18 @@ def _render_player_props(supabase, now_utc, eff_bankroll, eff_kelly, debug_mode=
     for _raw_book, _disp in _book_display_map.items():
         _book_disp_to_keys.setdefault(_disp, set()).add(_raw_book.lower())
 
-    st.markdown("Sportsbooks")
+    # Same directly-visible, full-width multiselect pattern already used
+    # by the Sportsbook Screener (tabs/sportsbook_screener.py) -- no
+    # popover/expander disclosure. _book_disp_to_keys can map one display
+    # name to MULTIPLE raw book keys (e.g. "Pinnacle" covering both
+    # "eu_pinnacle" and "pinnacle"), unlike the Screener's one-to-one
+    # map, so selection is still resolved back to a set of raw keys below
+    # rather than a single key per pick -- same filtering effect as the
+    # prior popover/checkbox UI, only the widget changed.
     _all_books_disp = sorted(_book_disp_to_keys.keys())
-    _selected_count = sum(1 for _b in _all_books_disp if st.session_state.get(f"fvm_prop_book_{_b}", True))
-    with st.popover(f"{_selected_count} of {len(_all_books_disp)} selected", use_container_width=True):
-        _psa, _psb = st.columns(2)
-        if _psa.button("Select all", use_container_width=True, key="fvm_prop_books_all"):
-            for _b in _all_books_disp:
-                st.session_state[f"fvm_prop_book_{_b}"] = True
-            st.rerun()
-        if _psb.button("Clear all", use_container_width=True, key="fvm_prop_books_none"):
-            for _b in _all_books_disp:
-                st.session_state[f"fvm_prop_book_{_b}"] = False
-            st.rerun()
-        st.divider()
-        _book_sel_disp = []
-        for _b in _all_books_disp:
-            _checked = st.checkbox(
-                _b, value=st.session_state.get(f"fvm_prop_book_{_b}", True), key=f"fvm_prop_book_{_b}",
-            )
-            if _checked:
-                _book_sel_disp.append(_b)
+    _book_sel_disp = st.multiselect(
+        "Sportsbooks", options=_all_books_disp, default=_all_books_disp, key="fvm_prop_books",
+    )
     _book_sel_keys: set[str] = set()
     for d in _book_sel_disp:
         _book_sel_keys |= _book_disp_to_keys.get(d, set())
@@ -526,25 +517,18 @@ def render(supabase, now_utc, eff_bankroll, eff_kelly, authed, debug_mode=False)
         _book_disp_to_keys.setdefault(_disp, set()).add(_raw_book.lower())
     _label_to_cfg = {c.market_label: c for c in MARKETS.values()}
 
-    st.markdown("Sportsbooks")
+    # Same directly-visible, full-width multiselect pattern already used
+    # by the Sportsbook Screener (tabs/sportsbook_screener.py) -- no
+    # popover/expander disclosure. _book_disp_to_keys can map one display
+    # name to MULTIPLE raw book keys (e.g. "Pinnacle" covering both
+    # "eu_pinnacle" and "pinnacle"), unlike the Screener's one-to-one
+    # map, so selection is still resolved back to a set of raw keys below
+    # rather than a single key per pick -- same filtering effect as the
+    # prior popover/checkbox UI, only the widget changed.
     _all_books_disp = sorted(_book_disp_to_keys.keys())
-    _selected_count = sum(1 for _b in _all_books_disp if st.session_state.get(f"fvm_book_{_b}", True))
-    with st.popover(f"{_selected_count} of {len(_all_books_disp)} selected", use_container_width=True):
-        _sa, _sb = st.columns(2)
-        if _sa.button("Select all", use_container_width=True, key="fvm_books_all"):
-            for _b in _all_books_disp:
-                st.session_state[f"fvm_book_{_b}"] = True
-            st.rerun()
-        if _sb.button("Clear all", use_container_width=True, key="fvm_books_none"):
-            for _b in _all_books_disp:
-                st.session_state[f"fvm_book_{_b}"] = False
-            st.rerun()
-        st.divider()
-        _book_sel_disp = []
-        for _b in _all_books_disp:
-            _checked = st.checkbox(_b, value=st.session_state.get(f"fvm_book_{_b}", True), key=f"fvm_book_{_b}")
-            if _checked:
-                _book_sel_disp.append(_b)
+    _book_sel_disp = st.multiselect(
+        "Sportsbooks", options=_all_books_disp, default=_all_books_disp, key="fvm_books",
+    )
     _book_sel_keys: set[str] = set()
     for d in _book_sel_disp:
         _book_sel_keys |= _book_disp_to_keys.get(d, set())
