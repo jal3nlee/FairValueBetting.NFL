@@ -229,18 +229,21 @@ def _render_player_props(supabase, now_utc, eff_bankroll, eff_kelly, debug_mode=
     for _raw_book, _disp in _book_display_map.items():
         _book_disp_to_keys.setdefault(_disp, set()).add(_raw_book.lower())
 
-    # Same directly-visible, full-width multiselect pattern already used
-    # by the Sportsbook Screener (tabs/sportsbook_screener.py) -- no
-    # popover/expander disclosure. _book_disp_to_keys can map one display
-    # name to MULTIPLE raw book keys (e.g. "Pinnacle" covering both
-    # "eu_pinnacle" and "pinnacle"), unlike the Screener's one-to-one
-    # map, so selection is still resolved back to a set of raw keys below
-    # rather than a single key per pick -- same filtering effect as the
-    # prior popover/checkbox UI, only the widget changed.
+    # Same always-visible pill/chip toggles as the Sportsbook Screener
+    # (tabs/sportsbook_screener.py) -- st.pills, not st.multiselect and
+    # not a popover/expander. Every sportsbook is shown at once so
+    # selected vs. deselected is immediately visible, matching the
+    # Screener's actual look, not just its filtering behavior.
+    # _book_disp_to_keys can map one display name to MULTIPLE raw book
+    # keys (e.g. "Pinnacle" covering both "eu_pinnacle" and "pinnacle"),
+    # unlike the Screener's one-to-one map, so selection is still
+    # resolved back to a set of raw keys below rather than a single key
+    # per pick -- same filtering effect as before, only the widget changed.
     _all_books_disp = sorted(_book_disp_to_keys.keys())
-    _book_sel_disp = st.multiselect(
-        "Sportsbooks", options=_all_books_disp, default=_all_books_disp, key="fvm_prop_books",
-    )
+    _book_sel_disp = st.pills(
+        "Sportsbooks", options=_all_books_disp, selection_mode="multi",
+        default=_all_books_disp, key="fvm_prop_books", width="stretch",
+    ) or []
     _book_sel_keys: set[str] = set()
     for d in _book_sel_disp:
         _book_sel_keys |= _book_disp_to_keys.get(d, set())
@@ -517,18 +520,21 @@ def render(supabase, now_utc, eff_bankroll, eff_kelly, authed, debug_mode=False)
         _book_disp_to_keys.setdefault(_disp, set()).add(_raw_book.lower())
     _label_to_cfg = {c.market_label: c for c in MARKETS.values()}
 
-    # Same directly-visible, full-width multiselect pattern already used
-    # by the Sportsbook Screener (tabs/sportsbook_screener.py) -- no
-    # popover/expander disclosure. _book_disp_to_keys can map one display
-    # name to MULTIPLE raw book keys (e.g. "Pinnacle" covering both
-    # "eu_pinnacle" and "pinnacle"), unlike the Screener's one-to-one
-    # map, so selection is still resolved back to a set of raw keys below
-    # rather than a single key per pick -- same filtering effect as the
-    # prior popover/checkbox UI, only the widget changed.
+    # Same always-visible pill/chip toggles as the Sportsbook Screener
+    # (tabs/sportsbook_screener.py) -- st.pills, not st.multiselect and
+    # not a popover/expander. Every sportsbook is shown at once so
+    # selected vs. deselected is immediately visible, matching the
+    # Screener's actual look, not just its filtering behavior.
+    # _book_disp_to_keys can map one display name to MULTIPLE raw book
+    # keys (e.g. "Pinnacle" covering both "eu_pinnacle" and "pinnacle"),
+    # unlike the Screener's one-to-one map, so selection is still
+    # resolved back to a set of raw keys below rather than a single key
+    # per pick -- same filtering effect as before, only the widget changed.
     _all_books_disp = sorted(_book_disp_to_keys.keys())
-    _book_sel_disp = st.multiselect(
-        "Sportsbooks", options=_all_books_disp, default=_all_books_disp, key="fvm_books",
-    )
+    _book_sel_disp = st.pills(
+        "Sportsbooks", options=_all_books_disp, selection_mode="multi",
+        default=_all_books_disp, key="fvm_books", width="stretch",
+    ) or []
     _book_sel_keys: set[str] = set()
     for d in _book_sel_disp:
         _book_sel_keys |= _book_disp_to_keys.get(d, set())

@@ -86,9 +86,16 @@ def render(supabase, now_utc):
             _seen_display.add(_dn)
     _sc_disp_to_key = {v: k for k, v in _sc_book_map.items()}
     _sc_all_display = sorted(_sc_book_map.values())
-    _sc_selected_display = st.multiselect(
-        "Sportsbooks", options=_sc_all_display, default=_sc_all_display, key="sc_books",
-    )
+    # Always-visible pill/chip toggles (st.pills, selection_mode="multi")
+    # instead of st.multiselect's dropdown-with-tags -- every sportsbook
+    # is shown at once so a selected vs. deselected book is immediately
+    # distinguishable, rather than only selected books appearing as tags
+    # and everything else living inside a closed dropdown. width="stretch"
+    # keeps this a full-width row, matching the rest of this filter area.
+    _sc_selected_display = st.pills(
+        "Sportsbooks", options=_sc_all_display, selection_mode="multi",
+        default=_sc_all_display, key="sc_books", width="stretch",
+    ) or []
     _sc_selected_keys = [_sc_disp_to_key[d] for d in _sc_selected_display if d in _sc_disp_to_key]
 
     if not _sc_selected_keys:
