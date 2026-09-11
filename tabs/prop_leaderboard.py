@@ -808,9 +808,9 @@ def render(supabase, now_utc):
     )
 
     _view = st.segmented_control(
-        "View", ["Player Research", "Prop Leaderboard"], default="Player Research",
+        "View", ["Prop Leaderboard", "Player Research"], default="Prop Leaderboard",
         key="pl_view", label_visibility="collapsed",
-    ) or "Player Research"
+    ) or "Prop Leaderboard"
 
     if _view == "Player Research":
         render_player_research_view(supabase, now_utc)
