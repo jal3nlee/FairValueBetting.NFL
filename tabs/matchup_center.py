@@ -357,11 +357,27 @@ def render(supabase, now_utc, eff_bankroll, eff_kelly):
                                 f"Avg {_rf_form['avg_scored']}-{_rf_form['avg_allowed']} "
                                 f"(margin {_rf_form['avg_margin']:+.1f})"
                             )
-                            for _g in reversed(_rf_form["games"]):
-                                st.caption(
-                                    f"{_g['result']} {_g['location']} {_g['opponent']} "
-                                    f"{_g['own_score']}-{_g['opp_score']}"
-                                )
+                            # Same rows/order/count get_team_recent_form_
+                            # with_fallback already returned above -- this
+                            # only changes how they're displayed (a table
+                            # instead of one st.caption per game).
+                            _rf_table_rows = [
+                                {
+                                    "Week": _g["week"],
+                                    "Opponent": f"{_g['location']} {_g['opponent']}",
+                                    "Result": _g["result"],
+                                    "Score": f"{_g['own_score']}-{_g['opp_score']}",
+                                }
+                                for _g in reversed(_rf_form["games"])
+                            ]
+                            st.dataframe(
+                                pd.DataFrame(_rf_table_rows),
+                                use_container_width=True, hide_index=True,
+                                column_config={
+                                    "Week": st.column_config.NumberColumn("Week", width="small"),
+                                    "Result": st.column_config.TextColumn("Result", width="small"),
+                                },
+                            )
                         else:
                             st.caption("No completed games yet this season.")
                 st.divider()
