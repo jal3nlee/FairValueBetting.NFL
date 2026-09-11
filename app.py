@@ -275,39 +275,28 @@ st.set_page_config(
 )
 SIDEBAR_W = 320
 DEBUG_MODE = False
-# The base URL of the standalone, cross-sport FVB-Platform product suite
-# (Sportsbook Screener / Prop Leaderboard) this NFL app's "FVB Products"
-# sidebar section links out to -- same overridable-env-var-with-a-live-
-# default convention already used for SUPABASE_URL etc. above, and the
-# same one FVB-Platform's own nav.py uses for its sibling links
-# (FVB_MARKETING_URL / FVB_NFL_URL / ...).
-FVB_PLATFORM_URL = os.getenv("FVB_PLATFORM_URL", "https://fairvaluebetting.com")
+# Base URL of the standalone, cross-sport FVB-Platform product suite
+# (Sportsbook Screener / Prop Leaderboard / Fair Value Props) the
+# sidebar's "Products" section links out to -- same overridable-env-var-
+# with-a-live-default convention already used for SUPABASE_URL etc.
+FVB_PLATFORM_URL = os.getenv("FVB_PLATFORM_URL", "https://fvb-platform.onrender.com")
+FVB_MARKETING_URL = os.getenv("FVB_MARKETING_URL", "https://fairvaluebetting.com")
 # =======================
 # SIDEBAR UI
 # =======================
-# Reorganized into the same section pattern as the newer standalone FVB-
-# Platform sidebar (nav.py there): a bold section label, a divider after
-# each group, external destinations as plain markdown links. Every piece
-# of existing functionality below (auth forms, Resources content, sign-
-# out logic, feedback submission) is unchanged -- only grouped under
-# clearer headings. "NFL" here is an orientation list, not clickable
-# navigation: this app selects tabs via st.tabs() in the main area, which
-# Streamlit provides no way to drive from the sidebar (no key/selection
-# API), so making these entries look clickable would be misleading. FVB
-# Products only links to Sportsbook Screener and Prop Leaderboard --
-# FVB-Platform's own Parlay Builder page doesn't exist yet (see its
-# nav.py: "Parlay Builder -- coming soon"), so this mirrors that same
-# non-link treatment rather than pointing at a page that isn't there.
+# Final section order: Branding -> Account -> Sports -> Products -> Learn,
+# matching the newer FVB product-site sidebar. Every existing behavior
+# below this comment (auth forms, sign-out, sign-up) is unchanged -- only
+# what surrounds it changed. The prior "NFL" in-app-tab orientation list
+# and the Resources dropdowns (How to use / Glossary / Feedback /
+# Disclaimer) are intentionally removed here, not relocated -- this pass
+# replaces them with the Sports/Products/Learn link sections above.
 with st.sidebar:
     if LOGO_PATH:
         st.image(str(LOGO_PATH), width=SIDEBAR_W)
     else:
         st.title("Fair Value Betting · NFL")
-    st.markdown(
-        "[fairvaluebetting.com](https://fairvaluebetting.com)  ·  "
-        "⚾ [MLB](https://mlb.fairvaluebetting.com)  ·  "
-        "🏈 [NCAAF](https://ncaaf.fairvaluebetting.com)"
-    )
+    st.caption("MODEL. PRICE. EDGE.")
     st.divider()
 
     st.markdown("**Account**")
@@ -388,101 +377,31 @@ with st.sidebar:
 
     st.divider()
 
-    # Orientation only, not clickable navigation -- this app switches
-    # sections via st.tabs() in the main area below, and Streamlit's
-    # st.tabs() has no key/selection API a sidebar control could drive.
-    # Listing the destinations here still gives users a map of the
-    # workspace without implying a link that wouldn't actually work.
-    st.markdown("**NFL**")
-    st.caption("This workspace's tabs, for quick orientation.")
-    st.markdown(
-        "- Fair Value Model\n"
-        "- Matchup Center\n"
-        "- Fantasy Tools\n"
-        "- Prop Research\n"
-        "- Sportsbook Screener\n"
-        "- Parlay Builder\n"
-        "- Arbitrage Tracker"
-    )
+    # Real external links to each sport's own deeper workspace app (this
+    # NFL app is one of them) -- plain text links, no icons, per the
+    # newer FVB product-site style.
+    st.markdown("**Sports**")
+    st.caption("Deeper fair-value research workspaces for each sport.")
+    st.markdown("[NFL workspace ↗](https://nfl.fairvaluebetting.com/)")
+    st.markdown("[MLB workspace ↗](https://mlb.fairvaluebetting.com/)")
+    st.markdown("[NCAAF workspace ↗](https://ncaaf.fairvaluebetting.com/)")
 
     st.divider()
 
     # Standalone, cross-sport FVB-Platform products -- separate deployed
-    # app, separate URL. Only Sportsbook Screener and Prop Leaderboard are
-    # live there today; Parlay Builder is shown the same non-link "coming
-    # soon" way FVB-Platform's own sidebar shows it, not as a dead link.
-    st.markdown("**FVB Products**")
-    st.caption("Standalone cross-sport tools.")
-    st.markdown(f"[📊 Sportsbook Screener ↗]({FVB_PLATFORM_URL}/screener)")
-    st.markdown(f"[🎯 Prop Leaderboard ↗]({FVB_PLATFORM_URL}/props)")
-    st.caption("🔒 Parlay Builder — coming soon")
+    # app, separate URL. Parlay Builder has no live page there yet, shown
+    # as a non-link caption rather than a dead link.
+    st.markdown("**Products**")
+    st.markdown(f"[Sportsbook Screener]({FVB_PLATFORM_URL}/screener)")
+    st.markdown(f"[Prop Leaderboard]({FVB_PLATFORM_URL}/props)")
+    st.markdown(f"[Fair Value Props]({FVB_PLATFORM_URL}/fair-value-props)")
+    st.caption("Parlay Builder — coming soon")
 
     st.divider()
-    st.markdown("**Resources**")
-with st.sidebar.expander("How to use", expanded=False):
-    st.markdown(
-        """
-1. **Fair Value Model** — starts with a Market Movers snapshot of today's slate and
-   the top EV plays, then lets you pick a Date Range and Market, filter by Expected
-   Value and Odds, and compare Best Odds against our Fair Odds estimate.
-2. **Matchup Center** — dig into any individual game's market snapshot and research.
-3. **Fantasy Tools** — Lineup Analysis (research weekly usage, props, game
-   environment, and matchup context for one player, or compare up to four) and
-   Draft Rankings (consensus ADP across platforms, filterable by position).
-4. **Prop Research** — research an individual player's props, season stats, recent
-   games, and matchup context directly, or find the top players on the best current
-   hit-rate streak for a selected prop.
-5. **Sportsbook Screener** — pure line shopping across every sportsbook.
-6. **Parlay Builder** — build and compare multi-leg parlays across sportsbooks.
-7. **Arbitrage Tracker** — scan current prices for markets where the best price on
-   each side, across different books, guarantees a profit regardless of outcome.
-        """
-    )
-with st.sidebar.expander("Glossary", expanded=False):
-    st.markdown(
-        """
-**EV% (Expected Value %)** — How favorable the offered price is versus the fair baseline (no-vig).  
-**Fair Odds** — The American-odds equivalent of the weighted, no-vig sportsbook consensus.
-        """
-    )
-with st.sidebar.expander("Feedback", expanded=False):
-    _fb_user = None
-    try:
-        _fb_user = getattr(st.session_state.get("sb_session", None), "user", None)
-    except Exception:
-        _fb_user = None
-    if not _fb_user:
-        st.info("You must be signed in to leave feedback.")
-    else:
-        with st.form("feedback_form", clear_on_submit=True):
-            _full_name  = (_fb_user.user_metadata or {}).get("full_name") or (_fb_user.user_metadata or {}).get("name") or ""
-            _email_addr = getattr(_fb_user, "email", "") or (_fb_user.user_metadata or {}).get("email", "")
-            st.markdown(f"**Submitting as:** {_full_name or 'Unknown'}  \n**Email:** {_email_addr or 'Unknown'}")
-            feedback_text = st.text_area("Share your thoughts, ideas, or issues:")
-            submitted     = st.form_submit_button("Submit Feedback")
-        if submitted:
-            txt = (feedback_text or "").strip()
-            if not txt:
-                st.warning("Please enter feedback before submitting.")
-            else:
-                try:
-                    supabase.table("feedback").insert(
-                        {
-                            "message": txt,
-                            "name":    _full_name.strip() or None,
-                            "email":   (_email_addr or "").strip() or None,
-                            "user_id": _fb_user.id,
-                        }
-                    ).execute()
-                    st.success("Thanks for your feedback!")
-                except Exception as e:
-                    st.error(f"Error saving feedback: {e}")
-with st.sidebar.expander("Disclaimer", expanded=False):
-    st.markdown(
-        """
-**Fair Value Betting** is for **education and entertainment** only — not financial or betting advice.
-        """
-    )
+
+    st.markdown("**Learn**")
+    st.markdown(f"[Education ↗]({FVB_MARKETING_URL}/howitworks.html)")
+    st.markdown(f"[Methodology ↗]({FVB_MARKETING_URL}/methodology.html)")
 # =======================
 # MAIN APP
 # =======================
