@@ -20,7 +20,6 @@ from tabs import (
     prop_leaderboard,
     sportsbook_screener,
     parlay_builder,
-    arbitrage_tracker,
 )
 # =======================
 # AUTH
@@ -427,7 +426,6 @@ def run_app():
         "Prop Research",
         "Sportsbook Screener",
         "Parlay Builder",
-        "Arbitrage Tracker",
     ])
     with tabs[0]:
         fair_value_model.render(supabase, now_utc, eff_bankroll, eff_kelly, authed, debug_mode=DEBUG_MODE)
@@ -441,7 +439,5 @@ def run_app():
         sportsbook_screener.render(supabase, now_utc)
     with tabs[5]:
         parlay_builder.render(supabase, now_utc, eff_bankroll, eff_kelly, authed)
-    with tabs[6]:
-        arbitrage_tracker.render(supabase, now_utc, eff_bankroll, eff_kelly)
 if __name__ == "__main__":
     run_app()
