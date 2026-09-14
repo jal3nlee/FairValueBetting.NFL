@@ -176,14 +176,33 @@ def _render_player_props(supabase, now_utc, eff_bankroll, eff_kelly, debug_mode=
         )
     window_start, window_end, _sport_keys, caption_label = get_date_window(now_utc, _window_choice)
 
+    # Player Props ingestion (fetch_odds_nfl_props.py) stops polling an
+    # event the moment its commence_time passes -- Phase 1 is pregame
+    # only, "no pregame prop polling after kickoff" -- so the last
+    # snapshot stored for an already-started event is a frozen pregame
+    # line, not fresh data. Without this, that event stays eligible for
+    # the REST of the selected calendar window (e.g. through the end of
+    # "NFL Week N") purely because window_start/window_end are calendar
+    # bounds with no "has this already started" check. Clamping the
+    # effective start to now_utc excludes any event whose commence_time
+    # has already passed, while window_end and the displayed
+    # caption_label (still describing the originally selected range)
+    # are untouched -- later games in the same window remain visible
+    # normally. Applied to BOTH the event-id lookup and the raw-row
+    # filter inside _load_fvm_player_props below, so an already-started
+    # event can't re-enter through that second calendar-only filter.
+    # Game Markets (render() below) is a separate read path and is not
+    # touched by this.
+    _prop_window_start = max(window_start, now_utc)
+
     with _pr3:
         _odds_format = st.selectbox("Odds Format", _format_options, key="fvm_prop_odds_format")
 
     # ── Load all approved prop markets ───────────────────────
     with st.spinner("Loading NFL player props..."):
-        event_ids = get_upcoming_prop_event_ids(supabase, window_start.isoformat(), window_end.isoformat())
+        event_ids = get_upcoming_prop_event_ids(supabase, _prop_window_start.isoformat(), window_end.isoformat())
         all_raw_props, all_prop_display = _load_fvm_player_props(
-            supabase, tuple(event_ids), window_start, window_end, eff_bankroll, eff_kelly,
+            supabase, tuple(event_ids), _prop_window_start, window_end, eff_bankroll, eff_kelly,
         )
 
     df_props = pd.concat(all_prop_display, ignore_index=True) if all_prop_display else pd.DataFrame()
