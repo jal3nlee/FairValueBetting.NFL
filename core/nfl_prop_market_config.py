@@ -111,15 +111,38 @@ _SUFFIXES = (" jr.", " jr", " sr.", " sr", " ii", " iii", " iv")
 _PUNCT_RE = re.compile(r"[.\-'’]")
 _WS_RE = re.compile(r"\s+")
 
+# Common first-name nickname -> canonical-form equivalences, applied to
+# ONLY the first name token, AFTER punctuation/suffix stripping -- so a
+# sportsbook's commonly-used short name (e.g. "Josh Palmer") and
+# nflreadpy's own roster full name (e.g. "Joshua Palmer") normalize to
+# the SAME key instead of silently failing to join. Deliberately small
+# and conservative: only well-established, unambiguous English
+# nickname/formal-name pairs, not a general fuzzy-match. Applied
+# identically wherever this function runs (sportsbook ingestion AND
+# roster mapping both call this one function), so it can only ever
+# create NEW matches -- two already-identical names stay identical
+# whether or not either happens to be in this table, so no existing
+# successful match can be broken by adding an entry here.
+_NICKNAME_TO_CANONICAL = {
+    "josh": "joshua", "mike": "michael", "chris": "christopher", "matt": "matthew",
+    "nick": "nicholas", "zach": "zachary", "zack": "zachary", "alex": "alexander",
+    "sam": "samuel", "ben": "benjamin", "dan": "daniel", "dave": "david",
+    "rob": "robert", "will": "william", "tony": "anthony", "cam": "cameron",
+    "ken": "kenneth", "greg": "gregory", "joe": "joseph", "jake": "jacob",
+    "tom": "thomas", "andy": "andrew", "steve": "steven",
+}
+
 
 def normalize_player_key(raw_name: str | None) -> str | None:
     """
     Returns a normalized player key for grouping (lowercase, punctuation
-    stripped, suffixes removed, whitespace collapsed), or None if the
-    input is empty/unusable. None means "exclude this row" to the
-    caller — normalization never guesses at an ambiguous or missing
-    name; it only cleans up unambiguous formatting variation
-    (capitalization, punctuation, suffixes, whitespace).
+    stripped, suffixes removed, whitespace collapsed, common first-name
+    nicknames canonicalized), or None if the input is empty/unusable.
+    None means "exclude this row" to the caller — normalization never
+    guesses at an ambiguous or missing name; it only cleans up
+    unambiguous formatting variation (capitalization, punctuation,
+    suffixes, whitespace, and a small curated set of nickname/formal-name
+    pairs), never a fuzzy or probabilistic match.
     """
     if not raw_name or not str(raw_name).strip():
         return None
@@ -129,4 +152,8 @@ def normalize_player_key(raw_name: str | None) -> str | None:
         if n.endswith(suffix):
             n = n[: -len(suffix)].strip()
             break
-    return n or None
+    if not n:
+        return None
+    parts = n.split(" ", 1)
+    parts[0] = _NICKNAME_TO_CANONICAL.get(parts[0], parts[0])
+    return " ".join(parts) or None

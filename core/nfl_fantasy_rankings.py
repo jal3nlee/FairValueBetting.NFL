@@ -10,14 +10,25 @@
 # formula selection — never to adjust, blend, or estimate a stat value.
 #
 # Phase 1 scoring inputs are deliberately narrow and APPLES-TO-APPLES
-# within a position: every ranked player at a position is scored from
-# the exact same set of required markets, so a market's absence for one
-# player can never silently advantage or disadvantage another player in
-# the same table (no optional/omitted components in the ranking score).
-#   QB      : Passing Yards, Passing TDs
-#   RB      : Rushing Yards, Receptions, Receiving Yards, Anytime TD
-#   WR / TE : Receptions, Receiving Yards, Anytime TD
-# Interceptions and QB rushing/Anytime-TD are ingested (see
+# within a position for every REQUIRED market: a player missing any
+# required market for his position is excluded outright, never zero-filled.
+#   QB      : Passing Yards, Passing TDs                          (both required)
+#   RB      : Rushing Yards, Receptions, Receiving Yards           (required)
+#             + Anytime TD                                        (optional/additive)
+#   WR / TE : Receptions, Receiving Yards                          (required)
+#             + Anytime TD                                        (optional/additive)
+# Anytime TD coverage from a single unified sportsbook feed turned out to
+# be thin enough (2+ books) that requiring it excluded most otherwise-
+# fully-covered RB/WR/TE players -- so it is now OPTIONAL/ADDITIVE per an
+# explicit product decision: when a valid 2+ book Anytime TD consensus
+# exists for a player, its Poisson-derived fantasy-point contribution
+# (unchanged math) is added on top of the required-market score; when it
+# doesn't, the player is NOT excluded and NO TD contribution is added --
+# never a fabricated/estimated/zero-implied probability. This is still
+# apples-to-apples WITHIN what's shown: the detail/UI layer marks exactly
+# which players had TD coverage and which didn't, rather than blending an
+# invisible zero into two different players' scores.
+# Interceptions and QB rushing/Anytime-TD-for-QB are ingested (see
 # core/nfl_prop_market_config.py::PROP_MARKETS) but deliberately NOT
 # consumed by this module's Phase 1 score — infrastructure for a future
 # phase once a consistent-coverage policy for them is established.
@@ -40,13 +51,23 @@ SCORING_OPTIONS = ["PPR", "Half PPR", "Standard"]
 RANKING_POSITIONS = ["QB", "RB", "WR", "TE"]
 
 # Required stored prop market(s) per position, keyed to PROP_MARKETS —
-# this dict IS the "consistent inputs" contract: a position's ranked
-# table can only ever be built from exactly this market set.
+# this dict IS the eligibility contract: a player missing ANY of these
+# for his position is excluded outright, never zero-filled.
 _REQUIRED_MARKETS = {
     "QB": ["player_pass_yds", "player_pass_tds"],
-    "RB": ["player_rush_yds", "player_receptions", "player_reception_yds", "player_anytime_td"],
-    "WR": ["player_receptions", "player_reception_yds", "player_anytime_td"],
-    "TE": ["player_receptions", "player_reception_yds", "player_anytime_td"],
+    "RB": ["player_rush_yds", "player_receptions", "player_reception_yds"],
+    "WR": ["player_receptions", "player_reception_yds"],
+    "TE": ["player_receptions", "player_reception_yds"],
+}
+
+# Optional/additive market(s) per position: contribute their fantasy-point
+# component when a valid 2+ book consensus exists, otherwise contribute
+# nothing and never exclude the player. Never zero-filled or estimated.
+_OPTIONAL_MARKETS = {
+    "QB": [],
+    "RB": ["player_anytime_td"],
+    "WR": ["player_anytime_td"],
+    "TE": ["player_anytime_td"],
 }
 
 
@@ -221,16 +242,18 @@ def build_fantasy_rankings(supabase, event_ids: list, window_start, window_end, 
     computes weighted lines + Anytime TD expectations, and assembles one
     ranked table per position under the strict "same required markets for
     every ranked player" rule (see module docstring / _REQUIRED_MARKETS).
+    Anytime TD (see _OPTIONAL_MARKETS) is additive when available and
+    simply omitted -- never excluded on, never zero-filled -- when not.
 
     Returns:
       {
-        "QB": DataFrame[Player, Team, Pos, FVB Fantasy Pts, Passing Yards, Passing TDs, _detail],
-        "RB": DataFrame[...], "WR": DataFrame[...], "TE": DataFrame[...],
-        "excluded": {"QB": n, "RB": n, "WR": n, "TE": n},   # players with a qualifying prop but missing >=1 required market or no roster match
-        "detail": {player_key: {market_label: {"value"/"prob", "num_books": n}, ...}},
+        "QB": DataFrame[Player, Team, Pos, FVB Fantasy Pts, Passing Yards, Passing TDs],
+        "RB"/"WR"/"TE": DataFrame[..., "Anytime TD (λ pts)" (NaN when unavailable), "_td_available"],
+        "excluded": {"QB": n, "RB": n, "WR": n, "TE": n},   # players with a qualifying prop but missing >=1 REQUIRED market or no roster match (never for missing Anytime TD alone)
+        "detail": {player_key: {market_label: {"value"/"prob", "num_books": n} or {"unavailable": True}, ...}},
         "considered": {"QB": n, ...},        # diagnostics: players with >=1 required-market prop for that position
         "excluded_detail": {"QB": [...], ...},  # diagnostics: {player_key, display_name, team, position, missing:[labels]}
-        "market_coverage": {market_key: n_players_passing_2plus_book_gate, ...},  # diagnostics
+        "market_coverage": {market_key: n_players_passing_2plus_book_gate, ...},  # diagnostics, includes player_anytime_td even though it's optional
         "anytime_td_diag": {"raw_rows": n, "sides_present": [...], "players_2plus_books": n},  # diagnostics
       }
     The "diagnostics"-labeled keys are read-only bookkeeping surfaced for
@@ -324,10 +347,22 @@ def build_fantasy_rankings(supabase, event_ids: list, window_start, window_end, 
             })
             continue
 
+        # Optional markets: looked up the same way, but a missing one
+        # never excludes the player and never contributes a zero-implied
+        # value -- td_row stays None, and the None just isn't added below.
+        optional_mkts = _OPTIONAL_MARKETS.get(position, [])
+        optional_rows = {mkt: lookup.get(mkt, {}).get(player_key) for mkt in optional_mkts}
+        td_row = optional_rows.get("player_anytime_td")
+        td_pts = td_row["td_fantasy_pts"] if td_row is not None else 0.0
+
         player_detail = {}
         for mkt, r in rows.items():
+            player_detail[PROP_MARKETS[mkt].market_label] = {"value": r["weighted_line"], "num_books": r["num_books"]}
+        for mkt, r in optional_rows.items():
             label = PROP_MARKETS[mkt].market_label
-            if mkt == "player_anytime_td":
+            if r is None:
+                player_detail[label] = {"unavailable": True}
+            elif mkt == "player_anytime_td":
                 player_detail[label] = {"prob": r["td_prob"], "lambda": r["td_lambda"],
                                          "fantasy_pts": r["td_fantasy_pts"], "num_books": r["num_books"]}
             else:
@@ -338,25 +373,27 @@ def build_fantasy_rankings(supabase, event_ids: list, window_start, window_end, 
         elif position == "RB":
             pts = _rb_points(
                 rows["player_rush_yds"]["weighted_line"], rows["player_reception_yds"]["weighted_line"],
-                rows["player_receptions"]["weighted_line"], rows["player_anytime_td"]["td_fantasy_pts"], scoring,
+                rows["player_receptions"]["weighted_line"], td_pts, scoring,
             )
         else:  # WR / TE
             pts = _wrte_points(
                 rows["player_reception_yds"]["weighted_line"], rows["player_receptions"]["weighted_line"],
-                rows["player_anytime_td"]["td_fantasy_pts"], scoring,
+                td_pts, scoring,
             )
 
         display_name = roster_info["display_name"] or next(iter(rows.values()))["player_display"]
         row_out = {
             "Player": display_name, "Team": roster_info["team"] or "", "Pos": position,
             "FVB Fantasy Pts": round(pts, 2), "_player_key": player_key,
+            "_td_available": td_row is not None,
         }
         for mkt, r in rows.items():
-            label = PROP_MARKETS[mkt].market_label
-            if mkt == "player_anytime_td":
-                row_out[f"{label} (λ pts)"] = round(r["td_fantasy_pts"], 2)
-            else:
-                row_out[label] = round(r["weighted_line"], 1)
+            row_out[PROP_MARKETS[mkt].market_label] = round(r["weighted_line"], 1)
+        if "player_anytime_td" in optional_mkts:
+            # NaN (not a string) when unavailable -- keeps this a uniform
+            # numeric column for the DataFrame; the UI layer formats NaN
+            # as "--" for display rather than implying a zero TD.
+            row_out["Anytime TD (λ pts)"] = round(td_row["td_fantasy_pts"], 2) if td_row is not None else float("nan")
         rows_by_pos[position].append(row_out)
         detail[player_key] = player_detail
 

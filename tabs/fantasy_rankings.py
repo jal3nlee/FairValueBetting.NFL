@@ -31,6 +31,12 @@ def _load_rankings(_supabase, event_ids: tuple, window_start, window_end, scorin
 def _detail_lines(detail_for_player: dict) -> list[str]:
     lines = []
     for label, d in detail_for_player.items():
+        if d.get("unavailable"):
+            # Anytime TD is optional/additive for RB/WR/TE -- this is not
+            # a sportsbook-implied zero-TD probability, just "we don't
+            # currently have a valid 2+ book consensus for this player."
+            lines.append(f"**{label}:** TD market unavailable — not included in this player's score")
+            continue
         n = d.get("num_books")
         if "prob" in d:
             lines.append(
@@ -54,7 +60,9 @@ def render(supabase, now_utc):
         "<div style='opacity:0.7;font-size:0.95rem;margin:0 0 10px 0'>"
         "FVB Fantasy Rankings translate sportsbook markets into fantasy points — "
         "not an independent player-performance projection. Every number below comes "
-        "directly from a sportsbook-weighted consensus market."
+        "directly from a sportsbook-weighted consensus market. For RB/WR/TE, Anytime TD "
+        "is included when a sportsbook consensus is available and simply omitted (never "
+        "assumed to be zero) when it isn't."
         "</div>",
         unsafe_allow_html=True,
     )
@@ -104,8 +112,16 @@ def render(supabase, now_utc):
     else:
         stat_cols = [c for c in df.columns if c not in _BASE_COLS and not c.startswith("_")]
         display_cols = [c for c in _BASE_COLS if c in df.columns] + stat_cols
+        _display_df = df[display_cols].copy()
+        _td_col = "Anytime TD (λ pts)"
+        if _td_col in _display_df.columns:
+            # Format to a uniform string column ("13.09" or "--") rather
+            # than leaving it numeric with NaN gaps -- an explicit "--"
+            # reads clearly as "not available" instead of a blank cell
+            # that could be misread as a rendering gap.
+            _display_df[_td_col] = _display_df[_td_col].apply(lambda v: f"{v:.2f}" if pd.notna(v) else "—")
         st.dataframe(
-            df[display_cols], use_container_width=True, hide_index=True,
+            _display_df, use_container_width=True, hide_index=True,
             height=min(760, 46 + 35 * len(df)),
             column_config={
                 "Rank": st.column_config.NumberColumn("RANK", width="small"),
@@ -113,6 +129,11 @@ def render(supabase, now_utc):
                 "Team": st.column_config.TextColumn("TEAM", width="small"),
                 "Pos": st.column_config.TextColumn("POS", width="small"),
                 "FVB Fantasy Pts": st.column_config.NumberColumn("FVB FANTASY PTS", width="small", format="%.2f"),
+                _td_col: st.column_config.TextColumn(
+                    "ANYTIME TD (λ PTS)", width="small",
+                    help="Optional/additive. \"—\" means no valid 2+ sportsbook Anytime TD consensus "
+                         "is currently available for this player — not a sportsbook-implied zero.",
+                ),
             },
         )
 
@@ -189,7 +210,7 @@ def _render_coverage_diagnostics(result: dict):
             coverage_rows.append(row)
         st.dataframe(pd.DataFrame(coverage_rows), use_container_width=True, hide_index=True)
 
-        st.markdown("**Anytime TD status**")
+        st.markdown("**Anytime TD status** (optional/additive for RB/WR/TE — does not exclude a player when unavailable)")
         td_diag = result.get("anytime_td_diag", {})
         st.markdown(
             f"- Raw Anytime TD line rows present: **{td_diag.get('raw_rows', 0)}**\n"
