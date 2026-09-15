@@ -228,25 +228,43 @@ def build_fantasy_rankings(supabase, event_ids: list, window_start, window_end, 
         "RB": DataFrame[...], "WR": DataFrame[...], "TE": DataFrame[...],
         "excluded": {"QB": n, "RB": n, "WR": n, "TE": n},   # players with a qualifying prop but missing >=1 required market or no roster match
         "detail": {player_key: {market_label: {"value"/"prob", "num_books": n}, ...}},
+        "considered": {"QB": n, ...},        # diagnostics: players with >=1 required-market prop for that position
+        "excluded_detail": {"QB": [...], ...},  # diagnostics: {player_key, display_name, team, position, missing:[labels]}
+        "market_coverage": {market_key: n_players_passing_2plus_book_gate, ...},  # diagnostics
+        "anytime_td_diag": {"raw_rows": n, "sides_present": [...], "players_2plus_books": n},  # diagnostics
       }
+    The "diagnostics"-labeled keys are read-only bookkeeping surfaced for
+    tabs/fantasy_rankings.py's Coverage Diagnostics expander -- they do not
+    feed the scoring/eligibility logic above, which is unchanged.
     Never estimates a missing required market — a player missing any
     required market for his position is excluded from that position's
     table entirely, counted in "excluded", not scored with a zero.
     """
     empty = {p: pd.DataFrame(columns=["Player", "Team", "Pos", "FVB Fantasy Pts"]) for p in RANKING_POSITIONS}
     if not event_ids:
-        return {**empty, "excluded": {p: 0 for p in RANKING_POSITIONS}, "detail": {}}
+        return {
+            **empty, "excluded": {p: 0 for p in RANKING_POSITIONS}, "detail": {},
+            "considered": {p: 0 for p in RANKING_POSITIONS}, "excluded_detail": {p: [] for p in RANKING_POSITIONS},
+            "market_coverage": {}, "anytime_td_diag": {"raw_rows": 0, "sides_present": [], "players_2plus_books": 0},
+        }
 
     def _load(market_key: str) -> pd.DataFrame:
         raw = fetch_prop_market_lines(supabase, list(event_ids), market_key)
         return filter_by_window(raw, window_start, window_end)
 
-    line_markets = {"player_pass_yds", "player_rush_yds", "player_reception_yds", "player_receptions"}
     market_data: dict = {}
     for mkt in {"player_pass_yds", "player_pass_tds", "player_rush_yds",
                 "player_reception_yds", "player_receptions"}:
         market_data[mkt] = weighted_market_lines(_load(mkt), mkt)
-    market_data["player_anytime_td"] = anytime_td_expectations(_load("player_anytime_td"))
+    td_raw = _load("player_anytime_td")
+    market_data["player_anytime_td"] = anytime_td_expectations(td_raw)
+
+    anytime_td_diag = {
+        "raw_rows": 0 if td_raw is None or td_raw.empty else len(td_raw),
+        "sides_present": [] if td_raw is None or td_raw.empty else sorted(td_raw["side"].dropna().unique().tolist()),
+        "players_2plus_books": 0 if market_data["player_anytime_td"].empty else len(market_data["player_anytime_td"]),
+    }
+    market_coverage = {mkt: (0 if df.empty else len(df)) for mkt, df in market_data.items()}
 
     lookup = {
         mkt: {row["player_key"]: row for row in df.to_dict("records")}
@@ -257,7 +275,12 @@ def build_fantasy_rankings(supabase, event_ids: list, window_start, window_end, 
 
     detail: dict = {}
     excluded = {p: 0 for p in RANKING_POSITIONS}
+    excluded_detail: dict = {p: [] for p in RANKING_POSITIONS}
+    considered: dict = {p: 0 for p in RANKING_POSITIONS}
     rows_by_pos = {p: [] for p in RANKING_POSITIONS}
+
+    for pos in RANKING_POSITIONS:
+        considered[pos] = len(set().union(*(set(lookup.get(mkt, {}).keys()) for mkt in _REQUIRED_MARKETS[pos])))
 
     # Universe of candidate player_keys: anyone appearing in ANY of the
     # required markets for ANY position, so we never miss a player who
@@ -276,6 +299,14 @@ def build_fantasy_rankings(supabase, event_ids: list, window_start, window_end, 
             for pos in RANKING_POSITIONS:
                 if player_key in lookup.get(_REQUIRED_MARKETS[pos][0], {}):
                     excluded[pos] += 1
+                    any_row = next((lookup[m][player_key] for m in _REQUIRED_MARKETS[pos]
+                                     if player_key in lookup.get(m, {})), None)
+                    excluded_detail[pos].append({
+                        "player_key": player_key,
+                        "display_name": (any_row or {}).get("player_display", player_key),
+                        "team": None, "position": "Unknown (no roster match)",
+                        "missing": ["Roster/position match"],
+                    })
             continue
 
         position = roster_info["position"]
@@ -286,6 +317,11 @@ def build_fantasy_rankings(supabase, event_ids: list, window_start, window_end, 
         rows = {mkt: lookup.get(mkt, {}).get(player_key) for mkt in required}
         if any(r is None for r in rows.values()):
             excluded[position] += 1
+            missing_labels = [PROP_MARKETS[m].market_label for m in required if rows[m] is None]
+            excluded_detail[position].append({
+                "player_key": player_key, "display_name": roster_info["display_name"],
+                "team": roster_info["team"], "position": position, "missing": missing_labels,
+            })
             continue
 
         player_detail = {}
@@ -333,4 +369,8 @@ def build_fantasy_rankings(supabase, event_ids: list, window_start, window_end, 
         result[pos] = df
     result["excluded"] = excluded
     result["detail"] = detail
+    result["considered"] = considered
+    result["excluded_detail"] = excluded_detail
+    result["market_coverage"] = market_coverage
+    result["anytime_td_diag"] = anytime_td_diag
     return result

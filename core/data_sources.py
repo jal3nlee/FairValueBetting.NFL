@@ -87,32 +87,83 @@ def filter_by_window(df: pd.DataFrame, window_start, window_end) -> pd.DataFrame
 # =======================
 # NFL WEEK / DATE WINDOW
 # =======================
-def thursday_after_labor_day_utc(year: int) -> datetime:
-    """Thursday after Labor Day at 00:00 ET, converted to UTC."""
+def _week1_thursday_et(year: int) -> datetime:
+    """Thursday after Labor Day, as an ET wall-clock datetime (00:00 ET)."""
     d = datetime(year, 9, 1, tzinfo=EASTERN)
     while d.weekday() != 0:  # 0 = Monday
         d += timedelta(days=1)
-    opener_et = (d + timedelta(days=3)).replace(hour=0, minute=0, second=0, microsecond=0)
-    return opener_et.astimezone(timezone.utc)
+    return (d + timedelta(days=3)).replace(hour=0, minute=0, second=0, microsecond=0)
+
+
+def thursday_after_labor_day_utc(year: int) -> datetime:
+    """Thursday after Labor Day at 00:00 ET, converted to UTC."""
+    return _week1_thursday_et(year).astimezone(timezone.utc)
+
+
+# An NFL week's active window runs from Thursday 00:00 ET through Monday
+# Night Football, and stays "current" until Tuesday 05:00 ET -- a fixed,
+# dependency-free ET-calendar boundary (not live game-completion data).
+# MNF always kicks off Monday evening ET and, even accounting for a rare
+# West-Coast overtime finish, is over well before 5 AM ET the next
+# morning. _week_start_et/_week_rollover_et are the single shared anchor
+# both nfl_week_window_utc() and infer_current_week_index() build on, so
+# the displayed date window and the inferred week number can't drift
+# apart from each other.
+_ROLLOVER_DAYS_AFTER_THURSDAY = 5  # Thursday + 5 days = the following Tuesday
+_ROLLOVER_HOUR_ET = 5
+
+
+def _week_start_et(week_index: int, year: int) -> datetime:
+    """ET wall-clock 00:00 Thursday start of the given week index --
+    calendar-day addition on the ET wall-clock Week-1 Thursday (not on an
+    already-UTC-converted instant), so the wall-clock start stays 00:00 ET
+    even for a week index on the far side of a DST transition from Week 1."""
+    wk1_et = _week1_thursday_et(year)
+    return (wk1_et + timedelta(days=7 * (week_index - 1))).replace(
+        hour=0, minute=0, second=0, microsecond=0
+    )
+
+
+def _week_rollover_et(week_index: int, year: int) -> datetime:
+    """ET wall-clock Tuesday 05:00 instant at which `week_index` ends and
+    the next week becomes current."""
+    start_et = _week_start_et(week_index, year)
+    return (start_et + timedelta(days=_ROLLOVER_DAYS_AFTER_THURSDAY)).replace(
+        hour=_ROLLOVER_HOUR_ET, minute=0, second=0, microsecond=0
+    )
 
 
 def nfl_week_window_utc(week_index: int, now_utc: datetime):
-    """Returns (start_utc, end_utc) for the given week index."""
+    """Returns (start_utc, end_utc) for the given week index: Thursday
+    00:00 ET through Tuesday 04:59:59 ET -- ending exactly one second
+    before the Tuesday 05:00 ET boundary infer_current_week_index() rolls
+    over on. Both are derived from the same _week_start_et/
+    _week_rollover_et anchors, so the two stay aligned by construction."""
     yr = now_utc.astimezone(EASTERN).year
-    start = thursday_after_labor_day_utc(yr) + timedelta(days=7 * (week_index - 1))
-    end = start + timedelta(days=5, hours=23, minutes=59, seconds=59)
-    return start, end
+    start_et = _week_start_et(week_index, yr)
+    end_et = _week_rollover_et(week_index, yr) - timedelta(seconds=1)
+    return start_et.astimezone(timezone.utc), end_et.astimezone(timezone.utc)
 
 
 def infer_current_week_index(now_utc: datetime) -> int:
     """Return 1 before Week 1 has started (explicitly surfaces Week 1
-    rather than a separate preseason window); otherwise clamp to 1..18."""
-    yr = now_utc.astimezone(EASTERN).year
-    wk1 = thursday_after_labor_day_utc(yr)
-    if now_utc < wk1:
+    rather than a separate preseason window); otherwise the week whose
+    Thursday-00:00-ET-through-Tuesday-05:00-ET window contains now_utc,
+    clamped to 1..18. The current week remains active through Monday
+    Night Football and all the way to Tuesday 05:00 ET, then rolls to the
+    next week -- a fixed ET-calendar boundary, not live game-completion
+    data. Walks forward one week at a time (at most 18 iterations) rather
+    than a closed-form day/7 division, so it's trivially verifiable
+    against the Tuesday-boundary examples this behavior is specified by."""
+    now_et = now_utc.astimezone(EASTERN)
+    yr = now_et.year
+    wk1_et = _week1_thursday_et(yr)
+    if now_et < wk1_et:
         return 1
-    weeks = (now_utc - wk1).days // 7 + 1
-    return max(1, min(18, weeks))
+    week = 1
+    while week < 18 and _week_rollover_et(week, yr) <= now_et:
+        week += 1
+    return week
 
 
 def sport_key_for_week(week_index: int) -> str:

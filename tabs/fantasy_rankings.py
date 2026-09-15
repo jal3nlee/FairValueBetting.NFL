@@ -8,7 +8,10 @@ import streamlit as st
 
 from core.data_sources import get_date_window, infer_current_week_index
 from core.nfl_prop_data_sources import get_upcoming_prop_event_ids
-from core.nfl_fantasy_rankings import build_fantasy_rankings, SCORING_OPTIONS, RANKING_POSITIONS
+from core.nfl_prop_market_config import PROP_MARKETS
+from core.nfl_fantasy_rankings import (
+    build_fantasy_rankings, SCORING_OPTIONS, RANKING_POSITIONS, _REQUIRED_MARKETS,
+)
 
 _BASE_COLS = ["Rank", "Player", "Team", "Pos", "FVB Fantasy Pts"]
 
@@ -139,3 +142,73 @@ def render(supabase, now_utc):
         "FVB Fantasy Rankings translate sportsbook markets into fantasy points. "
         "They are not an FVB fantasy projection model."
     )
+
+    _render_coverage_diagnostics(result)
+
+
+def _render_coverage_diagnostics(result: dict):
+    """Temporary/internal validation view — surfaces the SAME data already
+    loaded for the rankings above (result["considered"]/["excluded_detail"]/
+    ["market_coverage"]/["anytime_td_diag"], all computed once inside
+    build_fantasy_rankings) so coverage gaps are visible directly on the
+    live page instead of requiring a separate Render-shell diagnostic run.
+    No additional Supabase or Odds API calls; no methodology/eligibility
+    logic here — this only reads and displays already-computed results."""
+    with st.expander("Coverage Diagnostics", expanded=False):
+        st.caption(
+            "Internal validation view of the sportsbook-market coverage behind the "
+            "rankings above, from the same data already loaded on this page."
+        )
+
+        considered = result.get("considered", {})
+        excluded = result.get("excluded", {})
+        st.markdown("**Per-position coverage**")
+        st.dataframe(
+            pd.DataFrame([
+                {"Position": pos, "Players considered": considered.get(pos, 0),
+                 "Qualifying": len(result.get(pos, pd.DataFrame())), "Excluded": excluded.get(pos, 0)}
+                for pos in RANKING_POSITIONS
+            ]),
+            use_container_width=True, hide_index=True,
+        )
+
+        st.markdown("**Required-market coverage** (players reaching a 2+ sportsbook weighted consensus)")
+        market_coverage = result.get("market_coverage", {})
+        all_required_markets = sorted({m for pos in RANKING_POSITIONS for m in _REQUIRED_MARKETS[pos]})
+        coverage_rows = []
+        for pos in RANKING_POSITIONS:
+            row = {"Position": pos}
+            for mkt in all_required_markets:
+                label = PROP_MARKETS[mkt].market_label
+                # Cast to str: this column otherwise mixes int (a required
+                # market's player count) and "—" (not required for this
+                # position) within one column, which pyarrow can't convert
+                # for st.dataframe -- a real bug caught by testing this
+                # against a mixed-type fixture, not a style preference.
+                row[label] = str(market_coverage.get(mkt, 0)) if mkt in _REQUIRED_MARKETS[pos] else "—"
+            coverage_rows.append(row)
+        st.dataframe(pd.DataFrame(coverage_rows), use_container_width=True, hide_index=True)
+
+        st.markdown("**Anytime TD status**")
+        td_diag = result.get("anytime_td_diag", {})
+        st.markdown(
+            f"- Raw Anytime TD line rows present: **{td_diag.get('raw_rows', 0)}**\n"
+            f"- Yes/No sides present: **{td_diag.get('sides_present', [])}**\n"
+            f"- Players reaching a 2+ sportsbook fair-probability consensus: "
+            f"**{td_diag.get('players_2plus_books', 0)}**"
+        )
+
+        st.markdown("**Excluded players** (missing one or more required markets)")
+        excluded_detail = result.get("excluded_detail", {})
+        excl_rows = []
+        for pos in RANKING_POSITIONS:
+            for e in excluded_detail.get(pos, []):
+                excl_rows.append({
+                    "Player": e.get("display_name", ""), "Team": e.get("team") or "—",
+                    "Position": e.get("position", pos), "Missing required market(s)": ", ".join(e.get("missing", [])),
+                })
+        if excl_rows:
+            st.dataframe(pd.DataFrame(excl_rows), use_container_width=True, hide_index=True,
+                         height=min(500, 46 + 35 * len(excl_rows)))
+        else:
+            st.caption("No excluded players for the current selection.")
