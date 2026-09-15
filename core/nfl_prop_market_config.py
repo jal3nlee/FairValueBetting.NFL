@@ -55,12 +55,36 @@ PROP_MARKETS: dict[str, MarketConfig] = {
         label_a="Over", label_b="Under", group_keys=("player_key", "line"), line_col="line",
         display_line=True, market_label="Receptions",
     ),
+    "player_pass_interceptions": MarketConfig(
+        name="Interceptions", db_market_key="player_pass_interceptions",
+        odds_api_market="player_pass_interceptions",
+        valid_sides=("over", "under"), side_a="over", side_b="under",
+        price_a_col="over_price", price_b_col="under_price",
+        fair_a_col="over_fair_prob", fair_b_col="under_fair_prob",
+        label_a="Over", label_b="Under", group_keys=("player_key", "line"), line_col="line",
+        display_line=True, market_label="Interceptions",
+    ),
+    # Yes/No structure, not a two-sided Over/Under price pair — no numeric
+    # line, so group_keys omits "line" entirely (see build_prop_books_df's
+    # group_cols, which is now driven off group_keys rather than a
+    # hardcoded "line" column specifically so this market's rows survive
+    # its groupby instead of being dropped as NaN-key rows). Modeled on
+    # core/pipeline.py::MARKETS["moneyline"]'s two-sided/no-line shape.
+    "player_anytime_td": MarketConfig(
+        name="Anytime TD", db_market_key="player_anytime_td", odds_api_market="player_anytime_td",
+        valid_sides=("yes", "no"), side_a="yes", side_b="no",
+        price_a_col="yes_price", price_b_col="no_price",
+        fair_a_col="yes_fair_prob", fair_b_col="no_fair_prob",
+        label_a="Yes", label_b="No", group_keys=("player_key",), line_col=None,
+        display_line=False, market_label="Anytime TD",
+    ),
 }
 
 # Explicitly NOT in PROP_MARKETS (documented, not just omitted, so it's
 # clear these were considered and deliberately deferred, not forgotten):
-#   player_anytime_td, player_1st_td, player_last_td  — Yes/No structure,
-#     not a two-sided Over/Under price pair; needs separate treatment.
+#   player_1st_td, player_last_td — same Yes/No shape as Anytime TD but
+#     not yet needed by any Phase 1 consumer (Fantasy Rankings only uses
+#     Anytime TD); add if a future feature needs them.
 #   *_alternate markets, combo props, defense/kicking — deferred per
 #     Phase 1 scope.
 

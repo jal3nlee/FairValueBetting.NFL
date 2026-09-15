@@ -30,7 +30,8 @@ supabase: Client = create_client(SUPABASE_URL, SUPABASE_KEY)
 ODDS_API_SPORT_KEY = "americanfootball_nfl"
 SPORT = "NFL"
 PHASE1_MARKET_KEYS = list(PROP_MARKETS.keys())  # player_pass_yds, player_pass_tds, player_rush_yds,
-                                                 # player_reception_yds, player_receptions
+                                                 # player_reception_yds, player_receptions,
+                                                 # player_pass_interceptions, player_anytime_td
 
 # ── Retry/backoff (same shape as fetch_odds_nfl.py's; duplicated rather
 # than shared, matching that script's existing standalone convention). ──
@@ -194,8 +195,8 @@ def _normalize_and_write(event: dict, api_payload: dict):
                 continue
             for outcome in market.get("outcomes", []):
                 side_raw = (outcome.get("name") or "").strip().lower()
-                if side_raw not in ("over", "under"):
-                    continue  # Phase 1 markets are strictly two-sided
+                if side_raw not in ("over", "under", "yes", "no"):
+                    continue  # Phase 1 markets are strictly two-sided (Over/Under or Yes/No)
                 player_display = outcome.get("description")
                 player_key = normalize_player_key(player_display)
                 if player_key is None:

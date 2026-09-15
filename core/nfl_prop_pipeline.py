@@ -33,11 +33,16 @@ def build_prop_books_df(df_lines: pd.DataFrame, cfg: MarketConfig) -> pd.DataFra
     ingestion time) must already be excluded upstream — this function
     does not itself decide ambiguity, it only groups what it's given.
 
-    Grouping key: event_id, book, player_key, line — this is exactly
-    what prevents two different players (different player_key) from
-    merging into the same market, and what keeps two different lines
+    Grouping key: event_id, book, player_key, plus cfg.group_keys — this
+    is exactly what prevents two different players (different player_key)
+    from merging into the same market, and what keeps two different lines
     for the same player as separate markets, mirroring how Spread keeps
-    each distinct line separate today.
+    each distinct line separate today. Driven off cfg.group_keys (not a
+    hardcoded "line" column) so a line-less Yes/No market like Anytime TD
+    (group_keys=("player_key",), no "line") doesn't get every row silently
+    dropped by pandas' groupby(dropna=True) default over an all-NaN "line"
+    column. For every existing market, group_keys already includes "line",
+    so this is a no-op — identical grouping to before.
     """
     if df_lines.empty:
         return pd.DataFrame()
@@ -58,7 +63,8 @@ def build_prop_books_df(df_lines: pd.DataFrame, cfg: MarketConfig) -> pd.DataFra
     df[cfg.price_a_col] = df.apply(lambda r: r["price"] if r["side"] == cfg.side_a else None, axis=1)
     df[cfg.price_b_col] = df.apply(lambda r: r["price"] if r["side"] == cfg.side_b else None, axis=1)
 
-    group_cols = ["event_id", "home_team", "away_team", "commence_time", "book", "player_key", "line"]
+    base_group_cols = ["event_id", "home_team", "away_team", "commence_time", "book", "player_key"]
+    group_cols = base_group_cols + [k for k in cfg.group_keys if k not in base_group_cols and k in df.columns]
     result = (
         df.groupby(group_cols, as_index=False)
         .agg(**{
@@ -76,7 +82,8 @@ def build_prop_books_df(df_lines: pd.DataFrame, cfg: MarketConfig) -> pd.DataFra
     return validate_df(
         result.reset_index(drop=True), f"build_prop_books_df[{cfg.name}]",
         required=["event_id", "home_team", "away_team", "commence_time", "book",
-                  "player_key", "player_display", "line", cfg.price_a_col, cfg.price_b_col],
+                  "player_key", "player_display", cfg.price_a_col, cfg.price_b_col]
+                 + (["line"] if cfg.line_col else []),
     )
 
 
