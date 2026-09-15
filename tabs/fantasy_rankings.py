@@ -1,12 +1,8 @@
 # tabs/fantasy_rankings.py
-# Phase 1 Fantasy Rankings UI. NOT YET WIRED into tabs/fantasy_tools.py's
-# "Section" selector or app.py — same "built, not registered" convention
-# already used for tabs/player_research.py — pending the live-Supabase
-# coverage validation called for before this goes in front of users (see
-# the Fantasy Rankings implementation report). Wiring it in once that
-# validation looks sound is a two-line change: add "Fantasy Rankings" to
-# tabs/fantasy_tools.py's st.segmented_control options and an elif branch
-# calling this module's render(supabase, now_utc).
+# Phase 1 Fantasy Rankings UI — initial Beta release, wired into
+# tabs/fantasy_tools.py's "Section" selector. Sportsbook-market-only
+# translation into fantasy points (core/nfl_fantasy_rankings.py); no
+# methodology lives in this file, only presentation.
 import pandas as pd
 import streamlit as st
 
@@ -44,7 +40,13 @@ def _detail_lines(detail_for_player: dict) -> list[str]:
 
 
 def render(supabase, now_utc):
-    st.markdown("## Fantasy Rankings")
+    st.markdown(
+        "## Fantasy Rankings "
+        "<span style='font-size:0.62rem;font-weight:600;letter-spacing:0.04em;"
+        "opacity:0.65;border:1px solid currentColor;border-radius:4px;"
+        "padding:1px 6px;vertical-align:middle;margin-left:4px'>BETA</span>",
+        unsafe_allow_html=True,
+    )
     st.markdown(
         "<div style='opacity:0.7;font-size:0.95rem;margin:0 0 10px 0'>"
         "FVB Fantasy Rankings translate sportsbook markets into fantasy points — "
@@ -92,9 +94,9 @@ def render(supabase, now_utc):
 
     if df.empty:
         st.info(
-            f"No players currently qualify for {_position} in {caption_label} under Phase 1's "
-            "required-market coverage rule (a player must have sportsbook-weighted consensus "
-            "for every required market at his position, from at least 2 sportsbooks each)."
+            f"No {_position} rankings are available yet for {caption_label}. "
+            "Rankings populate once enough sportsbooks have posted the markets "
+            "needed to fairly score a player — check back as more lines are posted."
         )
     else:
         stat_cols = [c for c in df.columns if c not in _BASE_COLS and not c.startswith("_")]
@@ -130,7 +132,8 @@ def render(supabase, now_utc):
     if any(_excluded.values()):
         _parts = [f"{v} {p}" for p, v in _excluded.items() if v]
         st.caption(
-            f"Excluded from ranking (missing required sportsbook market coverage): {', '.join(_parts)}."
+            f"Not yet ranked due to limited sportsbook coverage: {', '.join(_parts)}. "
+            "These players will appear once enough sportsbooks post the required markets."
         )
     st.caption(
         "FVB Fantasy Rankings translate sportsbook markets into fantasy points. "
