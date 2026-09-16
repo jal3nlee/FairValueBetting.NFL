@@ -12,7 +12,9 @@ from core.nfl_prop_market_config import PROP_MARKETS
 from core.nfl_fantasy_rankings import (
     build_fantasy_rankings, SCORING_OPTIONS, RANKING_POSITIONS, _REQUIRED_MARKETS,
 )
-from core.nfl_provider_diagnostics import run_provider_diagnostics, ESTIMATED_MAX_CREDITS
+from core.nfl_provider_diagnostics import (
+    run_provider_diagnostics, ESTIMATED_MAX_CREDITS, TD_ALT_MARKETS, TD_ALT_LABELS,
+)
 
 _BASE_COLS = ["Rank", "Player", "Team", "Pos", "FVB Fantasy Pts"]
 
@@ -381,7 +383,67 @@ def _render_provider_diagnostics(supabase, event_ids: list):
                 use_container_width=True, hide_index=True,
             )
 
+        st.markdown("---")
+        st.markdown(
+            "**Alternative two-sided TD markets** (`player_tds`, `player_rush_reception_tds`) — "
+            "investigating whether either is a cleaner two-sided replacement for the currently "
+            "Yes-only `player_anytime_td`. \"Over 0.5\" on either is the same underlying event as "
+            "\"Anytime TD: Yes\". `player_tds` counts ALL touchdown types (including passing -- "
+            "not semantically correct for a QB without double-counting passing TDs). "
+            "`player_rush_reception_tds` excludes passing entirely, making it the semantically "
+            "correct candidate if either has real two-sided coverage. Not wired into Fantasy "
+            "Rankings -- investigation only."
+        )
+        for _mkt in TD_ALT_MARKETS:
+            _label = TD_ALT_LABELS[_mkt]
+            st.markdown(f"**{_label}** (`{_mkt}`)")
+            _bd = result.get("td_alt_breakdown", {}).get(_mkt)
+            if _bd is not None and not _bd.empty:
+                st.dataframe(_bd, use_container_width=True, hide_index=True)
+            else:
+                st.caption("No bookmaker returned this market under regions=us.")
+
+            with st.expander(f"Raw outcome sample — {_label} (verbatim, no processing)", expanded=False):
+                _rs = result.get("td_alt_raw_sample", {}).get(_mkt)
+                if _rs is not None and not _rs.empty:
+                    st.dataframe(_rs, use_container_width=True, hide_index=True)
+                else:
+                    st.caption("No outcomes available to sample.")
+
+            _viab = result.get("td_alt_viability", {}).get(_mkt, {})
+            st.dataframe(
+                pd.DataFrame([{
+                    "Total players @ 0.5 line": _viab.get("total_players", 0),
+                    "1+ two-sided books": _viab.get("n_1plus", 0),
+                    "2+ two-sided books": _viab.get("n_2plus", 0),
+                    "3+ two-sided books": _viab.get("n_3plus", 0),
+                }]),
+                use_container_width=True, hide_index=True,
+            )
+
+            _devig = result.get("td_alt_devig_check", {}).get(_mkt)
+            if not _devig or not _devig.get("found_two_sided_example"):
+                st.caption("No genuine two-sided 0.5-line example found -- existing-devig compatibility not testable from this response.")
+            else:
+                st.caption(
+                    f"Existing-devig compatibility check — player: {_devig.get('player_key')}, "
+                    f"book: {_devig.get('book')} — reached build_prop_books_df: "
+                    f"{_devig.get('reached_build_prop_books_df')}, reached _consensus_engine: "
+                    f"{_devig.get('reached_consensus_engine')}, fair Over prob: "
+                    f"{_devig.get('fair_over_prob')}, fair Under prob: {_devig.get('fair_under_prob')} "
+                    "— produced via the EXISTING, unmodified pipeline functions."
+                )
+
+            _overlap = result.get("td_alt_overlap", {}).get(_mkt, {})
+            st.caption(
+                f"Total players in this market: {_overlap.get('total_players', 0)} — "
+                f"overlapping with the player_anytime_td pool: {len(_overlap.get('overlap_with_anytime_td', []))} "
+                f"— not in the player_anytime_td pool: {len(_overlap.get('not_in_anytime_td', []))}"
+            )
+            st.markdown("")
+
         st.caption(
-            f"API credit note: this run makes 4 live Odds API requests, up to ~{ESTIMATED_MAX_CREDITS} "
-            "credits worst case, only when the button above is clicked, cached for 10 minutes after."
+            f"API credit note: this run makes 5 live Odds API requests (4 for the 7 current prop "
+            f"markets + 1 for the 2 alternative TD markets), up to ~{ESTIMATED_MAX_CREDITS} credits "
+            "worst case, only when the button above is clicked, cached for 10 minutes after."
         )
