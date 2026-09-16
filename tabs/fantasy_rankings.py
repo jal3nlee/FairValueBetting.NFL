@@ -12,6 +12,7 @@ from core.nfl_prop_market_config import PROP_MARKETS
 from core.nfl_fantasy_rankings import (
     build_fantasy_rankings, SCORING_OPTIONS, RANKING_POSITIONS, _REQUIRED_MARKETS,
 )
+from core.nfl_provider_diagnostics import run_provider_diagnostics, ESTIMATED_MAX_CREDITS
 
 _BASE_COLS = ["Rank", "Player", "Team", "Pos", "FVB Fantasy Pts"]
 
@@ -26,6 +27,17 @@ def _tight_label(text: str):
 @st.cache_data(ttl=300, show_spinner=False)
 def _load_rankings(_supabase, event_ids: tuple, window_start, window_end, scoring: str) -> dict:
     return build_fantasy_rankings(_supabase, list(event_ids), window_start, window_end, scoring)
+
+
+@st.cache_data(ttl=600, show_spinner="Querying Odds API provider diagnostics...")
+def _cached_run_provider_diagnostics(_supabase, event_id: str) -> dict:
+    # Cached for 10 minutes so repeated button clicks (or unrelated page
+    # reruns once a result already exists) don't re-spend API credits --
+    # this is the ONLY place in this file that calls
+    # core.nfl_provider_diagnostics.run_provider_diagnostics, and it is
+    # only ever invoked from inside the button-click branch below, never
+    # on a bare render().
+    return run_provider_diagnostics(_supabase, event_id)
 
 
 def _detail_lines(detail_for_player: dict) -> list[str]:
@@ -165,6 +177,7 @@ def render(supabase, now_utc):
     )
 
     _render_coverage_diagnostics(result)
+    _render_provider_diagnostics(supabase, event_ids)
 
 
 def _render_coverage_diagnostics(result: dict):
@@ -233,3 +246,130 @@ def _render_coverage_diagnostics(result: dict):
                          height=min(500, 46 + 35 * len(excl_rows)))
         else:
             st.caption("No excluded players for the current selection.")
+
+
+def _render_provider_diagnostics(supabase, event_ids: list):
+    """TEMPORARY, internal-only diagnostics for verifying The Odds API's
+    actual behavior for NFL player-prop markets (Anytime TD Yes/No
+    coverage, regions=us2, Kalshi/us_ex) -- see
+    core/nfl_provider_diagnostics.py for the underlying checks. Makes
+    live Odds API calls ONLY when the button below is clicked -- never on
+    a bare page load or unrelated rerun -- and the fetch itself is
+    wrapped in @st.cache_data(ttl=600) so repeated clicks within 10
+    minutes reuse the cached result instead of re-spending API credits.
+    Clearly separated from the customer-facing rankings above: its own
+    collapsed expander, explicitly labeled internal, no methodology or
+    eligibility logic anywhere in this function."""
+    with st.expander("Provider Diagnostics", expanded=False):
+        st.caption(
+            "Internal-only: verifies The Odds API's actual behavior for NFL player-prop "
+            "markets (Anytime TD Yes/No coverage, regions=us2, Kalshi). Not part of the "
+            "customer-facing rankings above -- for engineering validation."
+        )
+        if not event_ids:
+            st.caption("No upcoming event available to test right now.")
+            return
+
+        target_event_id = event_ids[0]
+        st.caption(f"Event to test: `{target_event_id}`")
+        st.caption(
+            f"This diagnostic may use up to ~{ESTIMATED_MAX_CREDITS} API credits per run "
+            "(4 live provider requests). Results are cached for 10 minutes -- repeated clicks "
+            "within that window will not re-spend credits."
+        )
+
+        if st.button("Run Provider Diagnostics", key="pd_run_btn"):
+            st.session_state["pd_result"] = _cached_run_provider_diagnostics(supabase, target_event_id)
+            st.session_state["pd_result_event_id"] = target_event_id
+
+        result = st.session_state.get("pd_result")
+        if result is None:
+            st.caption("Click the button above to run these checks against the live provider.")
+            return
+        if st.session_state.get("pd_result_event_id") != target_event_id:
+            st.caption(
+                "Note: the cached result below is for a previously-tested event, not the one "
+                "currently in view. Click Run again to refresh for this event."
+            )
+
+        if result.get("errors"):
+            st.error(
+                "Some diagnostic requests did not complete:\n\n"
+                + "\n".join(f"- {e}" for e in result["errors"])
+            )
+
+        ev = result.get("event", {})
+        st.markdown(
+            f"**Event tested:** {ev.get('away_team') or '?'} @ {ev.get('home_team') or '?'}  "
+            f"(`{ev.get('event_id') or target_event_id}`)"
+        )
+
+        st.markdown("**Anytime TD — US**")
+        _us_df = result.get("us_breakdown")
+        if _us_df is not None and not _us_df.empty:
+            st.dataframe(_us_df, use_container_width=True, hide_index=True)
+        else:
+            st.caption("No bookmaker returned player_anytime_td under regions=us.")
+
+        st.markdown("**Anytime TD — US2**")
+        _us2_df = result.get("us2_breakdown")
+        if _us2_df is not None and not _us2_df.empty:
+            st.dataframe(_us2_df, use_container_width=True, hide_index=True)
+        else:
+            st.caption("No bookmaker returned player_anytime_td under regions=us2.")
+        _us2_summary = result.get("us2_summary", {})
+        st.caption(
+            f"us2 total players: {_us2_summary.get('total_players', 0)} — "
+            f"new vs. us: {len(_us2_summary.get('new_players_vs_us', []))} "
+            f"{_us2_summary.get('new_players_vs_us', [])[:10]} — "
+            f"bookmakers unique to us2: {_us2_summary.get('unique_bookmakers', [])}"
+        )
+
+        st.markdown("**Kalshi coverage** (all 7 prop markets)")
+        st.caption(
+            f"Kalshi present under regions=us_ex: {'Yes' if result.get('kalshi_present_usex') else 'No'} — "
+            f"Kalshi present via bookmakers=kalshi (explicit): "
+            f"{'Yes' if result.get('kalshi_present_explicit') else 'No'}"
+        )
+        _kalshi_usex_df = result.get("kalshi_usex")
+        if _kalshi_usex_df is not None and not _kalshi_usex_df.empty:
+            st.dataframe(_kalshi_usex_df, use_container_width=True, hide_index=True)
+        _kalshi_explicit_df = result.get("kalshi_explicit")
+        if _kalshi_explicit_df is not None and not _kalshi_explicit_df.empty:
+            st.dataframe(_kalshi_explicit_df, use_container_width=True, hide_index=True)
+
+        st.markdown("**Two-sided coverage summary** (Anytime TD, regions=us) — the key decision metric")
+        _viability = result.get("two_sided_viability", {})
+        st.dataframe(
+            pd.DataFrame([{
+                "Total players": _viability.get("total_players", 0),
+                "1+ two-sided books": _viability.get("n_1plus", 0),
+                "2+ two-sided books": _viability.get("n_2plus", 0),
+                "3+ two-sided books": _viability.get("n_3plus", 0),
+            }]),
+            use_container_width=True, hide_index=True,
+        )
+
+        st.markdown("**Consensus drop check**")
+        _trace = result.get("drop_point_trace")
+        if _trace is None:
+            st.caption(
+                "No Yes-only player/book example found in this response — every Yes row had a "
+                "matching No row from the same book."
+            )
+        else:
+            st.dataframe(
+                pd.DataFrame([{
+                    "Player": _trace.get("player"), "Bookmaker": _trace.get("book"),
+                    "Yes price": _trace.get("yes_price"), "No price": _trace.get("no_price"),
+                    "Implied Yes": _trace.get("implied_yes"), "Implied No": _trace.get("implied_no"),
+                    "Survives both-sides gate": "Yes" if _trace.get("survives_dropna") else "No — DROPPED",
+                    "In final consensus": "Yes" if _trace.get("in_final_consensus") else "No",
+                }]),
+                use_container_width=True, hide_index=True,
+            )
+
+        st.caption(
+            f"API credit note: this run makes 4 live Odds API requests, up to ~{ESTIMATED_MAX_CREDITS} "
+            "credits worst case, only when the button above is clicked, cached for 10 minutes after."
+        )
