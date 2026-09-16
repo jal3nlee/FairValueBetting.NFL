@@ -53,10 +53,27 @@ def _detail_lines(detail_for_player: dict) -> list[str]:
             continue
         n = d.get("num_books")
         if "prob" in d:
+            source_label = {
+                "two-sided-only": "Two-sided devig",
+                "single-sided-only": "Single-sided • market-margin adjusted",
+                "mixed": "Mixed • two-sided + market-margin adjusted",
+            }.get(d.get("source"), "")
             lines.append(
                 f"**{label}:** {d['prob'] * 100:.1f}% fair Anytime TD probability "
                 f"(λ = {d['lambda']:.3f} → {d['fantasy_pts']:.2f} pts) — {n} sportsbook{'s' if n != 1 else ''}"
+                + (f" — *{source_label}*" if source_label else "")
             )
+            for cb in d.get("contributing_books", []):
+                if cb.get("source") == "two-sided":
+                    lines.append(f"  ◦ {cb['book']}: two-sided devig — fair prob {cb['fair_prob'] * 100:.1f}%")
+                else:
+                    _src_txt = ("book-specific margin" if cb.get("source") == "single-sided-book-margin"
+                                 else "cross-book fallback margin")
+                    _margin = cb.get("margin_used")
+                    lines.append(
+                        f"  ◦ {cb['book']}: single-sided, {_src_txt} = "
+                        f"{_margin * 100:.1f}% — fair prob {cb['fair_prob'] * 100:.1f}%"
+                    )
         else:
             lines.append(f"**{label}:** {d['value']:.1f} sportsbook-weighted consensus — {n} sportsbook{'s' if n != 1 else ''}")
     return lines

@@ -32,11 +32,24 @@
 # core/nfl_prop_market_config.py::PROP_MARKETS) but deliberately NOT
 # consumed by this module's Phase 1 score — infrastructure for a future
 # phase once a consistent-coverage policy for them is established.
+#
+# Anytime TD probability sourcing (see anytime_td_expectations below):
+# live provider investigation confirmed player_anytime_td is currently
+# returned Yes-only by every tested bookmaker, and no adequate two-sided
+# paired market exists through this provider. A book with true two-sided
+# Yes/No pricing still uses the original, unmodified two-sided devig path
+# (_consensus_engine). A book with only a Yes price is converted via a
+# bookmaker-specific, market-derived margin estimate (from that SAME
+# book's other currently-posted two-sided props) using a multiplicative
+# devig adjustment — never a fixed/hand-set vig percentage, never
+# historical rates, never player-specific. Both kinds of per-book fair
+# probabilities are combined into one BOOK_WEIGHTS-weighted consensus.
 import math
 
 import pandas as pd
 
-from core.pipeline import _book_weight, _consensus_engine
+from core.pipeline import _book_weight, _consensus_engine, _implied_prob_no_vig
+from core.odds_math import american_to_implied_prob
 from core.nfl_prop_market_config import PROP_MARKETS, MIN_BOOKS_FOR_PROP_CONSENSUS, normalize_player_key
 from core.nfl_prop_pipeline import build_prop_books_df
 from core.nfl_prop_data_sources import fetch_prop_market_lines
@@ -69,6 +82,27 @@ _OPTIONAL_MARKETS = {
     "WR": ["player_anytime_td"],
     "TE": ["player_anytime_td"],
 }
+
+# ── Single-sided Anytime TD methodology (approved design, see
+# core/nfl_fantasy_rankings.py's anytime_td_expectations docstring) ─────
+# Provider investigation (live, this week) confirmed player_anytime_td is
+# currently returned Yes-only by every tested US/US2 bookmaker, and that
+# no adequate two-sided paired market (player_tds, player_rush_reception_tds)
+# exists through this provider. A sportsbook's OWN currently-posted
+# two-sided companion prop markets (Passing Yards, Passing TDs, Rushing
+# Yards, Receiving Yards, Receptions) are used to estimate THAT
+# sportsbook's current margin, market-derived, never a fixed/hand-set
+# constant. A book needs at least this many qualifying (book, market)
+# observations before its OWN margin estimate is trusted.
+MIN_MARGIN_SAMPLES = 2
+# The cross-book fallback (average margin across OTHER books that DID
+# produce their own book-specific estimate) is only used when at least
+# this many other book-specific estimates exist this week -- otherwise
+# there is no defensible fallback and the book is omitted from the
+# Anytime TD consensus entirely, per the approved hierarchy.
+FALLBACK_MIN_BOOKS = 2
+_COMPANION_MARKETS = ["player_pass_yds", "player_pass_tds", "player_rush_yds",
+                      "player_reception_yds", "player_receptions"]
 
 
 # =======================
@@ -134,51 +168,260 @@ def weighted_market_lines(raw_lines: pd.DataFrame, market_key: str) -> pd.DataFr
 
 
 # =======================
+# BOOK-SPECIFIC MARGIN ESTIMATION (single-sided Anytime TD support)
+# =======================
+def _book_market_margins(raw_lines: pd.DataFrame, market_key: str) -> pd.DataFrame:
+    """
+    Per-book raw overround for ONE two-sided companion prop market: for
+    every (book, player_key, line) group where a book posted BOTH sides,
+    margin = implied_over + implied_under - 1 -- exactly the same `total`
+    quantity core/pipeline.py::_consensus_engine already computes
+    internally (as p_a+p_b) before normalizing away, just surfaced here
+    instead of discarded. Uses build_prop_books_df and
+    american_to_implied_prob UNMODIFIED -- introduces no new pricing
+    math, only exposes an existing intermediate quantity.
+
+    Returns columns: book, margin (one row per qualifying book/player/line
+    observation -- aggregated across observations by the caller).
+    """
+    cfg = PROP_MARKETS[market_key]
+    books_df = build_prop_books_df(raw_lines, cfg)
+    if books_df.empty:
+        return pd.DataFrame(columns=["book", "margin"])
+    books_df = books_df.dropna(subset=[cfg.price_a_col, cfg.price_b_col]).copy()
+    if books_df.empty:
+        return pd.DataFrame(columns=["book", "margin"])
+    books_df["_imp_a"] = books_df[cfg.price_a_col].apply(american_to_implied_prob)
+    books_df["_imp_b"] = books_df[cfg.price_b_col].apply(american_to_implied_prob)
+    books_df = books_df.dropna(subset=["_imp_a", "_imp_b"])
+    if books_df.empty:
+        return pd.DataFrame(columns=["book", "margin"])
+    books_df["margin"] = books_df["_imp_a"] + books_df["_imp_b"] - 1
+    return books_df[["book", "margin"]].reset_index(drop=True)
+
+
+def _derive_book_margins(companion_raw_lines: dict) -> dict:
+    """
+    companion_raw_lines: {market_key: raw_lines_df} for the 5 companion
+    two-sided prop markets (_COMPANION_MARKETS). Returns
+    {book: {"margin": float, "n_samples": int}} -- a book's OWN average
+    overround across however many (book, market) observations it
+    qualified for this event/week. A book with fewer than
+    MIN_MARGIN_SAMPLES qualifying observations is excluded here entirely
+    (not given a margin) -- the caller decides whether to use the
+    cross-book fallback or omit that book.
+
+    Individual observed margins are clipped to >=0 before averaging: a
+    single negative-margin observation is a data artifact (e.g. a stale
+    cross-book arbitrage snapshot), not real sportsbook behavior, and
+    letting it pull the average below zero would INFLATE the resulting
+    fair probability above the book's own raw price -- never desirable
+    for a devig-style adjustment, which should only ever remove margin,
+    never add to it.
+    """
+    all_margins = []
+    for market_key in _COMPANION_MARKETS:
+        raw = companion_raw_lines.get(market_key)
+        if raw is None or raw.empty:
+            continue
+        m = _book_market_margins(raw, market_key)
+        if not m.empty:
+            all_margins.append(m)
+    if not all_margins:
+        return {}
+    combined = pd.concat(all_margins, ignore_index=True)
+    out = {}
+    for book, grp in combined.groupby("book"):
+        vals = grp["margin"].clip(lower=0.0)
+        out[book] = {"margin": float(vals.mean()), "n_samples": int(len(grp))}
+    return out
+
+
+def _fallback_margin(book_margins: dict) -> float:
+    """
+    Cross-book fallback margin: the average of every book-specific margin
+    that WAS successfully derived this week, for use only by a book that
+    itself lacks enough companion two-sided markets. Still 100%
+    market-derived (never a fixed constant) -- just not specific to the
+    one book being adjusted. Requires at least FALLBACK_MIN_BOOKS other
+    book-specific estimates to exist; returns None otherwise, meaning
+    there is no defensible fallback and the caller must omit the book.
+    """
+    if len(book_margins) < FALLBACK_MIN_BOOKS:
+        return None
+    return float(sum(v["margin"] for v in book_margins.values()) / len(book_margins))
+
+
+def _single_sided_fair_prob(yes_price, book_margin: float):
+    """
+    p_raw = american_to_implied_prob(yes_price)
+    p_fair = p_raw / (1 + book_margin)   -- multiplicative/proportional
+    devig, the standard method for recovering a fair probability from one
+    observed side under an assumed proportional margin structure (the
+    same structure already implicit in how every two-sided market in this
+    app computes `total = p_a + p_b` = 1+margin before normalizing).
+    book_margin is clamped to >=0 (never let a negative estimate inflate
+    p_fair above p_raw). Returns None if the price is invalid or the
+    result falls outside a valid open probability interval (0, 1) --
+    reusing the same bounds discipline as the two-sided path's own
+    Poisson guard, never a fabricated value.
+    """
+    p_raw = american_to_implied_prob(yes_price)
+    if p_raw is None:
+        return None
+    margin = book_margin if (book_margin is not None and book_margin > 0) else 0.0
+    p_fair = p_raw / (1 + margin)
+    if p_fair is None or p_fair <= 0 or p_fair >= 1:
+        return None
+    return p_fair
+
+
+# =======================
 # ANYTIME TD -> POISSON FANTASY-POINT CONVERSION
 # =======================
-def anytime_td_expectations(raw_lines: pd.DataFrame) -> pd.DataFrame:
+def anytime_td_expectations(raw_lines: pd.DataFrame, companion_raw_lines: dict = None) -> pd.DataFrame:
     """
-    Mechanical market translation, not a player-specific model:
-      1. per-book Yes/No devig                (core/pipeline.py::_implied_prob_no_vig, unmodified)
-      2. existing BOOK_WEIGHTS -> fair consensus P(TD>=1)  (core/pipeline.py::_consensus_engine, unmodified)
+    Mechanical market translation, not a player-specific model. Combines,
+    per player, whichever of these apply across the contributing books:
+
+      TWO-SIDED (unchanged from the original approved methodology):
+        1. per-book Yes/No devig      (core/pipeline.py::_implied_prob_no_vig, unmodified)
+        2. BOOK_WEIGHTS-weighted fair consensus P(TD>=1) across the
+           two-sided books ONLY (core/pipeline.py::_consensus_engine,
+           unmodified -- called on exactly the two-sided-book subset, so
+           when a player has ONLY two-sided books this reduces to
+           byte-identical output to before companion_raw_lines existed).
+
+      SINGLE-SIDED (new, additive, only used when companion_raw_lines is
+      given and a book posted Yes with no No):
+        1. book-specific margin estimate from that SAME book's own other
+           two-sided companion props this week (_derive_book_margins),
+           falling back to the cross-book average only with sufficient
+           evidence (_fallback_margin), else the book is OMITTED --
+           never a fixed/hand-set vig percentage.
+        2. p_fair = p_raw / (1 + book_margin)   (_single_sided_fair_prob)
+
+      Both kinds of per-book fair probabilities are then combined into
+      ONE consensus using the exact same BOOK_WEIGHTS-weighted-average
+      principle _consensus_engine already applies -- mathematically, a
+      weighted average of (a two-sided sub-consensus, itself already a
+      weighted average) and (individual single-sided fair probabilities)
+      IS the overall weighted average of every contributing book, since a
+      weighted average of weighted averages (weighted by their own total
+      weight) equals the combined weighted average of the underlying
+      elements.
+
       3. lambda = -ln(1 - P)
       4. expected_td_points = lambda * 6.0     (core/lineup_data.py::_PTS_PER_TD, reused unchanged)
 
     Returns columns: player_key, player_display, td_prob, td_lambda,
-    td_fantasy_pts, num_books. Groups below MIN_BOOKS_FOR_PROP_CONSENSUS
-    are excluded, matching every other market's coverage gate.
+    td_fantasy_pts, num_books, source ("two-sided-only" / "single-sided-only"
+    / "mixed"), contributing_books (list of {book, source, margin_used,
+    fair_prob} -- margin_used is None for two-sided books). Groups below
+    MIN_BOOKS_FOR_PROP_CONSENSUS (combined two-sided + single-sided book
+    count) are excluded, matching every other market's coverage gate.
     """
+    empty_cols = ["player_key", "player_display", "td_prob", "td_lambda", "td_fantasy_pts",
+                  "num_books", "source", "contributing_books"]
     cfg = PROP_MARKETS["player_anytime_td"]
     books_df = build_prop_books_df(raw_lines, cfg)
     if books_df.empty:
-        return pd.DataFrame(columns=["player_key", "player_display", "td_prob", "td_lambda",
-                                      "td_fantasy_pts", "num_books"])
+        return pd.DataFrame(columns=empty_cols)
 
-    cons = _consensus_engine(
-        df=books_df, group_keys=["player_key"], side_a_price=cfg.price_a_col, side_b_price=cfg.price_b_col,
-        out_a=cfg.fair_a_col, out_b=cfg.fair_b_col, label=cfg.name,
-    )
-    if cons.empty:
-        return pd.DataFrame(columns=["player_key", "player_display", "td_prob", "td_lambda",
-                                      "td_fantasy_pts", "num_books"])
+    # ── Two-sided subset: existing devig path, UNCHANGED. ──
+    two_sided_df = books_df.dropna(subset=[cfg.price_a_col, cfg.price_b_col])
+    two_sided_cons = pd.DataFrame()
+    two_sided_weight_by_player: dict = {}
+    if not two_sided_df.empty:
+        two_sided_cons = _consensus_engine(
+            df=two_sided_df, group_keys=["player_key"], side_a_price=cfg.price_a_col, side_b_price=cfg.price_b_col,
+            out_a=cfg.fair_a_col, out_b=cfg.fair_b_col, label=cfg.name,
+        )
+        for pk, grp in two_sided_df.groupby("player_key"):
+            two_sided_weight_by_player[pk] = sum(_book_weight(b) for b in grp["book"].unique())
 
-    cons = cons[cons["num_books"] >= MIN_BOOKS_FOR_PROP_CONSENSUS].reset_index(drop=True)
-    if cons.empty:
-        return pd.DataFrame(columns=["player_key", "player_display", "td_prob", "td_lambda",
-                                      "td_fantasy_pts", "num_books"])
+    # ── Single-sided subset: new margin-adjusted path. ──
+    single_sided_df = books_df[books_df[cfg.price_a_col].notna() & books_df[cfg.price_b_col].isna()]
+    book_margins = _derive_book_margins(companion_raw_lines or {})
+    fallback_margin = _fallback_margin(book_margins)
 
-    def _lambda(p):
-        if p is None or pd.isna(p) or p < 0 or p >= 1:
-            return None
-        return -math.log(1 - p)
+    single_rows_by_player: dict = {}
+    if not single_sided_df.empty:
+        for _, r in single_sided_df.iterrows():
+            book = r["book"]
+            margin_info = book_margins.get(book)
+            if margin_info is not None and margin_info["n_samples"] >= MIN_MARGIN_SAMPLES:
+                margin_used, source = margin_info["margin"], "single-sided-book-margin"
+            elif fallback_margin is not None:
+                margin_used, source = fallback_margin, "single-sided-cross-book-fallback"
+            else:
+                continue  # no defensible market-derived margin -- omit this book, never a fixed constant
+            fair_p = _single_sided_fair_prob(r[cfg.price_a_col], margin_used)
+            if fair_p is None:
+                continue
+            single_rows_by_player.setdefault(r["player_key"], []).append({
+                "book": book, "source": source, "margin_used": round(margin_used, 4), "fair_prob": fair_p,
+                "weight": _book_weight(book),
+            })
 
-    cons["td_prob"] = cons[cfg.fair_a_col]
-    cons["td_lambda"] = cons["td_prob"].apply(_lambda)
-    cons["td_fantasy_pts"] = cons["td_lambda"].apply(lambda l: (l * _PTS_PER_TD) if l is not None else None)
-
+    # ── Combine per player. ──
     display = books_df[["player_key", "player_display"]].drop_duplicates(subset=["player_key"])
-    cons = cons.merge(display, on="player_key", how="left")
-    return cons[["player_key", "player_display", "td_prob", "td_lambda", "td_fantasy_pts", "num_books"]]
+    display_by_key = dict(zip(display["player_key"], display["player_display"]))
+
+    all_player_keys = set(two_sided_weight_by_player.keys()) | set(single_rows_by_player.keys())
+    out_rows = []
+    for pk in all_player_keys:
+        contributing_books = []
+        num_two_sided = 0
+        fair_two_sided, w_two_sided = None, 0.0
+        if pk in two_sided_weight_by_player and not two_sided_cons.empty:
+            row = two_sided_cons[two_sided_cons["player_key"] == pk]
+            if not row.empty:
+                fair_two_sided = float(row.iloc[0][cfg.fair_a_col])
+                w_two_sided = two_sided_weight_by_player[pk]
+                num_two_sided = int(two_sided_df[two_sided_df["player_key"] == pk]["book"].nunique())
+                contributing_books.append({
+                    "book": ", ".join(sorted(two_sided_df[two_sided_df["player_key"] == pk]["book"].unique())),
+                    "source": "two-sided", "margin_used": None, "fair_prob": round(fair_two_sided, 4),
+                })
+
+        single_rows = single_rows_by_player.get(pk, [])
+        w_single = sum(r["weight"] for r in single_rows)
+        for r in single_rows:
+            contributing_books.append({
+                "book": r["book"], "source": r["source"],
+                "margin_used": r["margin_used"], "fair_prob": round(r["fair_prob"], 4),
+            })
+
+        total_weight = w_two_sided + w_single
+        if total_weight <= 0:
+            continue
+        numerator = (fair_two_sided * w_two_sided if fair_two_sided is not None else 0.0) + \
+                    sum(r["fair_prob"] * r["weight"] for r in single_rows)
+        fair_consensus = numerator / total_weight
+
+        num_books = num_two_sided + len(single_rows)
+        if num_books < MIN_BOOKS_FOR_PROP_CONSENSUS:
+            continue
+
+        if fair_consensus is None or fair_consensus < 0 or fair_consensus >= 1:
+            continue
+        lam = -math.log(1 - fair_consensus)
+
+        if num_two_sided > 0 and single_rows:
+            source = "mixed"
+        elif num_two_sided > 0:
+            source = "two-sided-only"
+        else:
+            source = "single-sided-only"
+
+        out_rows.append({
+            "player_key": pk, "player_display": display_by_key.get(pk, pk),
+            "td_prob": fair_consensus, "td_lambda": lam, "td_fantasy_pts": lam * _PTS_PER_TD,
+            "num_books": num_books, "source": source, "contributing_books": contributing_books,
+        })
+
+    return pd.DataFrame(out_rows, columns=empty_cols) if out_rows else pd.DataFrame(columns=empty_cols)
 
 
 # =======================
@@ -276,11 +519,13 @@ def build_fantasy_rankings(supabase, event_ids: list, window_start, window_end, 
         return filter_by_window(raw, window_start, window_end)
 
     market_data: dict = {}
-    for mkt in {"player_pass_yds", "player_pass_tds", "player_rush_yds",
-                "player_reception_yds", "player_receptions"}:
-        market_data[mkt] = weighted_market_lines(_load(mkt), mkt)
+    companion_raw_lines: dict = {}
+    for mkt in _COMPANION_MARKETS:
+        raw = _load(mkt)
+        companion_raw_lines[mkt] = raw  # reused for single-sided Anytime TD margin estimation below -- no extra fetch
+        market_data[mkt] = weighted_market_lines(raw, mkt)
     td_raw = _load("player_anytime_td")
-    market_data["player_anytime_td"] = anytime_td_expectations(td_raw)
+    market_data["player_anytime_td"] = anytime_td_expectations(td_raw, companion_raw_lines)
 
     anytime_td_diag = {
         "raw_rows": 0 if td_raw is None or td_raw.empty else len(td_raw),
@@ -363,8 +608,11 @@ def build_fantasy_rankings(supabase, event_ids: list, window_start, window_end, 
             if r is None:
                 player_detail[label] = {"unavailable": True}
             elif mkt == "player_anytime_td":
-                player_detail[label] = {"prob": r["td_prob"], "lambda": r["td_lambda"],
-                                         "fantasy_pts": r["td_fantasy_pts"], "num_books": r["num_books"]}
+                player_detail[label] = {
+                    "prob": r["td_prob"], "lambda": r["td_lambda"], "fantasy_pts": r["td_fantasy_pts"],
+                    "num_books": r["num_books"], "source": r.get("source"),
+                    "contributing_books": r.get("contributing_books", []),
+                }
             else:
                 player_detail[label] = {"value": r["weighted_line"], "num_books": r["num_books"]}
 
