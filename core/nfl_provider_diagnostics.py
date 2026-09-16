@@ -85,23 +85,43 @@ def _by_player_sides(outcomes: list) -> dict:
 
 def _anytime_td_book_breakdown(payload: dict, flag_books: list = None) -> pd.DataFrame:
     """One row per bookmaker that returned player_anytime_td in this
-    payload: player/both/yes-only/no-only counts."""
+    payload: player/both/yes-only/no-only counts, plus a raw ungrouped
+    outcome count and a distinct (description, side) pair count -- if
+    "Total Outcomes" == "Players", each player has exactly one outcome
+    (genuinely single-sided data). If "Distinct (desc,side) pairs" is
+    LARGER than "Players", some outcomes for the same real player are
+    grouping under different description keys (a description-formatting
+    mismatch, not single-sided data) -- this distinguishes the two
+    possible explanations directly rather than by inference."""
     flag_books = set(flag_books or [])
     rows = []
     if not payload:
-        return pd.DataFrame(columns=["Bookmaker", "Players", "Both Yes+No", "Yes only", "No only", "Flagged"])
+        return pd.DataFrame(columns=["Bookmaker", "Players", "Both Yes+No", "Yes only", "No only",
+                                      "Total Outcomes", "Distinct (desc,side) pairs",
+                                      "Raw 'Yes' count", "Raw 'No' count", "Flagged"])
     for book in payload.get("bookmakers", []):
         book_key = book.get("key")
         for m in book.get("markets", []):
             if m.get("key") != "player_anytime_td":
                 continue
-            by_player = _by_player_sides(m.get("outcomes", []))
+            outcomes = m.get("outcomes", [])
+            by_player = _by_player_sides(outcomes)
             both = sum(1 for s in by_player.values() if {"yes", "no"}.issubset(s))
             yes_only = sum(1 for s in by_player.values() if "yes" in s and "no" not in s)
             no_only = sum(1 for s in by_player.values() if "no" in s and "yes" not in s)
+            distinct_pairs = {(o.get("description"), (o.get("name") or "").strip().lower()) for o in outcomes}
+            # Zero-grouping cross-check: literal occurrence count of the
+            # raw side string, bypassing _by_player_sides entirely -- if
+            # this disagrees with yes_only/no_only above, the bug is in
+            # the grouping step; if it agrees, the "single-sided" result
+            # is real and the bug (if any) is upstream of this function.
+            raw_yes_count = sum(1 for o in outcomes if (o.get("name") or "").strip().lower() == "yes")
+            raw_no_count = sum(1 for o in outcomes if (o.get("name") or "").strip().lower() == "no")
             rows.append({
                 "Bookmaker": book_key, "Players": len(by_player), "Both Yes+No": both,
                 "Yes only": yes_only, "No only": no_only,
+                "Total Outcomes": len(outcomes), "Distinct (desc,side) pairs": len(distinct_pairs),
+                "Raw 'Yes' count": raw_yes_count, "Raw 'No' count": raw_no_count,
                 "Flagged": "Yes" if book_key in flag_books else "",
             })
     return pd.DataFrame(rows)
