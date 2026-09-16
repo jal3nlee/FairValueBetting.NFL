@@ -311,6 +311,18 @@ def _render_provider_diagnostics(supabase, event_ids: list):
         else:
             st.caption("No bookmaker returned player_anytime_td under regions=us.")
 
+        with st.expander("Raw outcome sample (verbatim, no processing)", expanded=False):
+            st.caption(
+                "A handful of literal outcome objects from the provider response, unprocessed -- "
+                "use this to sanity-check the aggregated breakdown above against the actual field "
+                "values if a count looks surprising."
+            )
+            _raw_sample_df = result.get("raw_sample")
+            if _raw_sample_df is not None and not _raw_sample_df.empty:
+                st.dataframe(_raw_sample_df, use_container_width=True, hide_index=True)
+            else:
+                st.caption("No outcomes available to sample.")
+
         st.markdown("**Anytime TD — US2**")
         _us2_df = result.get("us2_breakdown")
         if _us2_df is not None and not _us2_df.empty:

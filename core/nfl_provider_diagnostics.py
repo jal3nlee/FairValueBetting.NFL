@@ -130,6 +130,36 @@ def _anytime_td_raw_rows(payload: dict, event: dict) -> list:
     return out
 
 
+def _raw_outcome_sample(payload: dict, book_key_filter: str = None, limit: int = 12) -> pd.DataFrame:
+    """Verbatim, unprocessed outcome rows for player_anytime_td -- no
+    lowercasing, no grouping, no aggregation -- so the literal provider
+    response shape can be inspected directly when the aggregated
+    breakdown looks surprising. If book_key_filter is given, only that
+    book's outcomes are sampled; otherwise the first book with any
+    player_anytime_td outcomes is used."""
+    cols = ["Bookmaker", "name (raw)", "description (raw)", "price", "point"]
+    if not payload:
+        return pd.DataFrame(columns=cols)
+    rows = []
+    for book in payload.get("bookmakers", []):
+        book_key = book.get("key")
+        if book_key_filter and book_key != book_key_filter:
+            continue
+        for m in book.get("markets", []):
+            if m.get("key") != "player_anytime_td":
+                continue
+            for o in m.get("outcomes", []):
+                rows.append({
+                    "Bookmaker": book_key, "name (raw)": o.get("name"),
+                    "description (raw)": o.get("description"), "price": o.get("price"), "point": o.get("point"),
+                })
+                if len(rows) >= limit:
+                    return pd.DataFrame(rows, columns=cols)
+        if rows and not book_key_filter:
+            break  # got a full sample from the first book that had any -- stop there
+    return pd.DataFrame(rows, columns=cols)
+
+
 def _kalshi_market_coverage(payload: dict) -> pd.DataFrame:
     """One row per one of the 7 markets, reporting whether Kalshi
     returned it in this payload and the shape of what it returned."""
@@ -271,6 +301,13 @@ def run_provider_diagnostics(supabase, event_id: str) -> dict:
 
     out["us_breakdown"] = _anytime_td_book_breakdown(payload_us, FLAG_BOOKS)
     out["us2_breakdown"] = _anytime_td_book_breakdown(payload_us2)
+    # Verbatim raw sample -- prefer draftkings (most commonly scrutinized
+    # book) if present, else whichever book returned anything, so an
+    # aggregated count that looks surprising can be checked against the
+    # literal provider response with no processing in between.
+    out["raw_sample"] = _raw_outcome_sample(payload_us, book_key_filter="draftkings")
+    if out["raw_sample"].empty:
+        out["raw_sample"] = _raw_outcome_sample(payload_us)
 
     raw_us = _anytime_td_raw_rows(payload_us, event)
     raw_us2 = _anytime_td_raw_rows(payload_us2, event)
