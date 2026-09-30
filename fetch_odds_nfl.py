@@ -234,48 +234,49 @@ def _fetch_odds_with_retries(url: str, params: dict, label: str):
     return last_resp
 
 
-def run_pull():
-    now_utc = datetime.now(timezone.utc)
-    last_pulled = _get_last_pull_time(supabase)
-    game_times = _get_known_game_times(supabase)
-    interval_seconds, cadence_state = _determine_cadence_seconds(now_utc, game_times)
+# Regions fetched for NFL game markets each cycle: "us" (traditional
+# sportsbooks -- exactly what this script has always fetched) and "us_ex"
+# (The Odds API's "US Exchanges" category: Kalshi, Polymarket, Novig,
+# ProphetX, BetOpenly). Each region gets its own odds_snapshots rows via
+# the existing `region` column (no schema change) -- the "us" fetch/parse/
+# write logic below is byte-for-byte what run_pull() always did, now
+# parameterized by `region` instead of hardcoding the literal so a second
+# region can reuse it identically rather than duplicating the loop.
+# Whether a given us_ex source actually affects the app's weighted
+# consensus (vs. just being stored/visible) is decided in
+# core/pipeline.py::_is_consensus_eligible, not here -- this script's job
+# is only to fetch and store raw lines, same as it always was for "us".
+GAME_MARKET_REGIONS = ["us", "us_ex"]
 
-    if interval_seconds is not None and last_pulled is not None:
-        elapsed = (now_utc - last_pulled).total_seconds()
-        if elapsed < interval_seconds:
-            print(
-                f"Skipping fetch — cadence state is '{cadence_state}' (target interval "
-                f"{interval_seconds}s), only {elapsed:.0f}s since last successful pull "
-                f"at {last_pulled.isoformat()}."
-            )
-            return
 
-    print(
-        f"Cadence state: {cadence_state} "
-        f"(target interval: {interval_seconds if interval_seconds is not None else 'n/a — no schedule data yet'}s)"
-    )
-
-    total_rows = 0
-    total_games = 0
+def _fetch_and_store_region(region: str) -> tuple:
+    """
+    Fetches and stores one region's worth of NFL game-market odds (every
+    sport key x every market) -- the exact logic previously inlined in
+    run_pull() for region="us" alone, now reusable for region="us_ex" too.
+    Returns (rows_inserted, games_pulled) for this region.
+    """
+    region_rows = 0
+    region_games = 0
     for odds_api_sport_key in ODDS_API_SPORT_KEYS:
-        print(f"Fetching NFL odds ({odds_api_sport_key})...")
+        print(f"Fetching NFL odds ({odds_api_sport_key}, region={region})...")
         url = f"https://api.the-odds-api.com/v4/sports/{odds_api_sport_key}/odds"
         params = {
             "apiKey":     ODDS_API_KEY,
-            "regions":    "us",
+            "regions":    region,
             "markets":    ",".join(markets),
             "oddsFormat": "american",
         }
-        resp = _fetch_odds_with_retries(url, params, label=odds_api_sport_key)
+        resp = _fetch_odds_with_retries(url, params, label=f"{odds_api_sport_key} ({region})")
         if resp is None or resp.status_code != 200:
             if resp is not None:
-                print(f"Error for {odds_api_sport_key}:", resp.status_code, resp.text)
+                print(f"Error for {odds_api_sport_key} ({region}):", resp.status_code, resp.text)
             continue
         data = resp.json()
         if not data:
-            print(f"No games returned for {odds_api_sport_key}.")
+            print(f"No games returned for {odds_api_sport_key} ({region}).")
             continue
-        total_games += len(data)
+        region_games += len(data)
 
         for market_key in markets:
             snapshot_id = str(uuid.uuid4())
@@ -285,7 +286,7 @@ def run_pull():
                 "pulled_at": datetime.now(timezone.utc).isoformat(),
                 "payload":   data,
                 "sport":     SPORT,
-                "region":    "us",
+                "region":    region,
             }).execute()
 
             lines = []
@@ -328,10 +329,42 @@ def run_pull():
             for i in range(0, len(lines), BATCH_SIZE):
                 batch = lines[i:i + BATCH_SIZE]
                 supabase.table("odds_lines").insert(batch).execute()
-                total_rows += len(batch)
+                region_rows += len(batch)
 
-    print(f"Done. Inserted {total_rows} rows across {len(ODDS_API_SPORT_KEYS) * len(markets)} snapshots.")
-    print(f"Total games pulled across both sport keys: {total_games}")
+    return region_rows, region_games
+
+
+def run_pull():
+    now_utc = datetime.now(timezone.utc)
+    last_pulled = _get_last_pull_time(supabase)
+    game_times = _get_known_game_times(supabase)
+    interval_seconds, cadence_state = _determine_cadence_seconds(now_utc, game_times)
+
+    if interval_seconds is not None and last_pulled is not None:
+        elapsed = (now_utc - last_pulled).total_seconds()
+        if elapsed < interval_seconds:
+            print(
+                f"Skipping fetch — cadence state is '{cadence_state}' (target interval "
+                f"{interval_seconds}s), only {elapsed:.0f}s since last successful pull "
+                f"at {last_pulled.isoformat()}."
+            )
+            return
+
+    print(
+        f"Cadence state: {cadence_state} "
+        f"(target interval: {interval_seconds if interval_seconds is not None else 'n/a — no schedule data yet'}s)"
+    )
+
+    total_rows = 0
+    total_games = 0
+    for region in GAME_MARKET_REGIONS:
+        region_rows, region_games = _fetch_and_store_region(region)
+        total_rows += region_rows
+        total_games += region_games
+
+    print(f"Done. Inserted {total_rows} rows across "
+          f"{len(GAME_MARKET_REGIONS) * len(ODDS_API_SPORT_KEYS) * len(markets)} snapshots.")
+    print(f"Total games pulled across both sport keys and {len(GAME_MARKET_REGIONS)} region(s): {total_games}")
 
 
 if __name__ == "__main__":

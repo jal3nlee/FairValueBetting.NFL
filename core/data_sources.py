@@ -58,18 +58,34 @@ def get_lines_for_snapshot(_supabase, snapshot_id: str):
     return pd.DataFrame(rows)
 
 
+# Regions combined for game-market reads: "us" (traditional sportsbooks,
+# unchanged) and "us_ex" (The Odds API's "US Exchanges" category --
+# Kalshi/Polymarket/Novig/ProphetX/BetOpenly). Matches
+# fetch_odds_nfl.py::GAME_MARKET_REGIONS -- each region is written to its
+# own odds_snapshots row (existing region column, no schema change), so
+# every tab calling fetch_market_lines sees both automatically once
+# us_ex data exists, with zero changes needed in core/pipeline.py's
+# build_books_df/best_prices or any tab. Whether a given us_ex source
+# actually counts toward weighted consensus (as opposed to just being
+# visible for line-shopping/best-price) is decided separately in
+# core/pipeline.py::_is_consensus_eligible -- this function's job is only
+# to return the combined raw rows.
+GAME_MARKET_REGIONS = ["us", "us_ex"]
+
+
 def fetch_market_lines(_supabase, sport_keys: set, market_label: str):
     all_lines, pulled_ats = [], []
     db_market = MARKET_MAP.get(market_label, market_label)
     for sport in sorted(sport_keys):
-        snap_id, pulled_at = get_latest_snapshot_meta(_supabase, sport, db_market, region="us")
-        if not snap_id:
-            continue
-        df = get_lines_for_snapshot(_supabase, snap_id)
-        if not df.empty:
-            all_lines.append(df)
-        if pulled_at:
-            pulled_ats.append(pulled_at)
+        for region in GAME_MARKET_REGIONS:
+            snap_id, pulled_at = get_latest_snapshot_meta(_supabase, sport, db_market, region=region)
+            if not snap_id:
+                continue
+            df = get_lines_for_snapshot(_supabase, snap_id)
+            if not df.empty:
+                all_lines.append(df)
+            if pulled_at:
+                pulled_ats.append(pulled_at)
     if all_lines:
         return pd.concat(all_lines, ignore_index=True), pulled_ats
     return pd.DataFrame(), pulled_ats

@@ -133,6 +133,58 @@ def _book_weight(book: str) -> float:
 
 
 # =======================
+# CONSENSUS ELIGIBILITY (separate from BOOK_WEIGHTS / ANCHOR_BOOKS)
+# =======================
+# "US Exchanges" sources (The Odds API's regions=us_ex category --
+# prediction-market/exchange venues, structurally different from a
+# traditional sportsbook's quote) must be explicitly approved before their
+# prices count toward the BOOK_WEIGHTS-weighted fair-value consensus
+# (_consensus_engine). This is intentionally separate from BOOK_WEIGHTS
+# (a weight) and ANCHOR_BOOKS (used only for the consensus-confidence
+# rating's dispersion calc) -- it's a narrower gate answering a different
+# question: "may this source's price influence Fair Odds/EV/Kelly at
+# all," not "how much."
+#
+# Every traditional sportsbook -- whether or not it has an explicit
+# BOOK_WEIGHTS entry -- is UNAFFECTED by this gate and behaves exactly as
+# it did before this section existed: _is_consensus_eligible() returns
+# True for anything not in EXCHANGE_BOOKS below, same as always.
+#
+# An exchange source is eligible ONLY if listed in
+# CONSENSUS_ELIGIBLE_EXCHANGE_BOOKS. Kalshi is listed there because it
+# already has a deliberately-configured BOOK_WEIGHTS/ANCHOR_BOOKS entry --
+# this preserves that existing decision, it doesn't newly grant it.
+# Polymarket, Novig, ProphetX, and BetOpenly are NOT listed -- they remain
+# fully visible everywhere else (sportsbook filters, best-price/line-
+# shopping, the per-game "compare all sportsbooks" table) but contribute
+# nothing to Fair Odds, EV%, Kelly, or the consensus-confidence rating
+# until a deliberate decision adds them here.
+#
+# This gate is applied in run_market_pipeline ONLY to the rows passed into
+# _consensus_engine -- best_prices() and build_market_intelligence() still
+# receive every book unfiltered, which is what keeps an ineligible
+# exchange source's own price visible for shopping/comparison. Known
+# limitation: if an ineligible source posts the ONLY line at a given
+# spread/total value (no eligible book shares that exact line), that one
+# line's row won't appear in the final display at all, because
+# run_market_pipeline's existing inner-merge between best_prices() and
+# _consensus_engine()'s output (unchanged here) requires both to have a
+# row for the same group. This is an existing property of that merge, not
+# new behavior introduced by this gate, and is expected to be rare for
+# game markets (unlike player props, spread/total lines cluster tightly
+# around values every major book already posts).
+EXCHANGE_BOOKS = {"kalshi", "polymarket", "novig", "prophetx", "betopenly"}
+CONSENSUS_ELIGIBLE_EXCHANGE_BOOKS = {"kalshi"}
+
+
+def _is_consensus_eligible(book: str) -> bool:
+    b = str(book).lower()
+    if b in EXCHANGE_BOOKS:
+        return b in CONSENSUS_ELIGIBLE_EXCHANGE_BOOKS
+    return True
+
+
+# =======================
 # GENERIC MARKET BUILDER
 # =======================
 def build_books_df(df_lines: pd.DataFrame, cfg: MarketConfig) -> pd.DataFrame:
@@ -493,8 +545,15 @@ def run_market_pipeline(raw_lines, cfg, bankroll, kelly, min_ev, min_fair_pct, s
             )
             return pd.DataFrame()
 
+        # Consensus-eligibility gate (see _is_consensus_eligible above):
+        # only affects what's passed into _consensus_engine. best_prices()
+        # and build_market_intelligence() below still receive the full,
+        # unfiltered books_df, so an ineligible source (e.g. Polymarket)
+        # stays fully visible for best-price/line-shopping/comparison --
+        # it simply doesn't influence the weighted fair-value calculation.
+        consensus_books_df = books_df[books_df["book"].apply(_is_consensus_eligible)].reset_index(drop=True)
         cons = _consensus_engine(
-            df=books_df, group_keys=merge_keys, side_a_price=cfg.price_a_col, side_b_price=cfg.price_b_col,
+            df=consensus_books_df, group_keys=merge_keys, side_a_price=cfg.price_a_col, side_b_price=cfg.price_b_col,
             out_a=cfg.fair_a_col, out_b=cfg.fair_b_col, label=cfg.name,
         )
         trace.after_consensus = len(cons)
