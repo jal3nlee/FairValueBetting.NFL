@@ -125,6 +125,15 @@ BOOK_WEIGHTS: dict = {
     "ballybet": 0.35, "betparx": 0.35, "betonline": 0.35,
     "fliff": 0.35, "rebet": 0.35, "underdog": 0.35,
     "betanysports": 0.30, "bovada": 0.30, "mybookie": 0.30, "betus": 0.30,
+    # Explicit 0.0 for non-consensus-eligible US Exchanges sources (see
+    # _is_consensus_eligible below, which is the actual gate keeping these
+    # out of weighted consensus today). These entries are a defensive
+    # safeguard/documentation layer only -- purely relying on _book_weight's
+    # generic 0.30 fallback for an unlisted book would be wrong for these,
+    # so if the gate is ever bypassed or refactored later, these sources
+    # still can't silently inherit a nonzero weight. Kalshi is deliberately
+    # NOT listed here -- it keeps its real 0.75 weight above.
+    "polymarket": 0.0, "novig": 0.0, "prophetx": 0.0, "betopenly": 0.0,
 }
 
 
