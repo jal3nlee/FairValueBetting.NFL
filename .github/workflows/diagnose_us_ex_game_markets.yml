@@ -1,0 +1,25 @@
+name: Diagnose us_ex Game-Market Coverage
+
+# Manual trigger ONLY -- no `schedule:` trigger, unlike fetch_odds_nfl.yml
+# and fetch_odds_nfl_props.yml. This never runs automatically; it only
+# runs when someone clicks "Run workflow" in the Actions tab. Diagnostic
+# only -- runs diagnose_us_ex_game_markets.py, which makes read-only Odds
+# API calls and NO Supabase writes, NO ingestion, and touches no model/
+# weight/devig/consensus/EV/Kelly logic. Does not modify or interact with
+# fetch_odds_nfl.yml / fetch_odds_nfl_props.yml in any way.
+on:
+  workflow_dispatch:
+
+jobs:
+  diagnose:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - run: pip install requests
+      - name: Run us_ex diagnostic
+        env:
+          ODDS_API_KEY: ${{ secrets.ODDS_API_KEY }}
+        run: python diagnose_us_ex_game_markets.py
